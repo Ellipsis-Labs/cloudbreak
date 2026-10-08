@@ -154,6 +154,61 @@ For native development, `nix develop path:.` provides the same build toolchain.
 Validate the local release script with
 `python3 -m unittest discover -s scripts -p 'test_build_and_push_local.py'`.
 
+## Production telemetry
+
+The unified Docker image enables the `cloudbreak/phoenix-telemetry` feature.
+The fork-specific implementation lives in `crates/phoenix-telemetry`; builds
+without that feature retain the upstream telemetry initializer. Native builds
+can opt in with `cargo run -p cloudbreak --features phoenix-telemetry -- ...`.
+
+Use the same environment configuration as Phoenix's production services:
+
+```sh
+TRACING_LOG_FORMAT=json
+DD_ENV=prod
+DD_VERSION="<image-tag>"
+OTEL_EXPORTER_OTLP_INSECURE=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://datadog-agent.datadog-operator.svc.cluster.local:4317
+OTEL_RESOURCE_ATTRIBUTES="k8s.pod.ip=<pod-ip>,k8s.pod.uid=<pod-uid>,k8s.pod.name=<pod-name>"
+```
+
+Supply these variables through the workload's environment/ConfigMap, replacing
+the placeholders with the image tag and Kubernetes downward API values. Setting
+an OTLP endpoint enables trace export even when `[tracing]` is absent. The
+trace-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence over the
+general endpoint, which takes precedence over TOML. The existing `[tracing]`
+batch, sampling, and span-filter options remain supported; use `span-filter = []`
+to include all existing spans, including HTTP body transport. Invalid telemetry
+configuration is reported at startup.
+
+The default service names are `cloudbreak-api`, `cloudbreak-indexer`,
+`cloudbreak-snapshot`, and `cloudbreak-query-tracker`, selected by the command.
+`OTEL_SERVICE_NAME` overrides the name. `DD_ENV` and `DD_VERSION` supply the
+environment/version unless those resource attributes are explicitly provided.
+`OTEL_TRACES_SAMPLER_ARG` overrides the root sampling ratio (default 0.1);
+children follow the incoming parent's sampling decision. `OTEL_SDK_DISABLED=true`
+disables exporting. `RUST_LOG` controls stdout and the existing runtime log-filter
+endpoint; `RUST_TRACING` independently controls tracing verbosity.
+
+JSON logs include `dd.trace_id` and `dd.span_id` when inside an active span.
+HTTP requests continue incoming W3C `traceparent`/`tracestate` context. On normal
+completion, SIGINT, or SIGTERM, the service flushes its exporter before the Tokio
+runtime exits. Signal handling cancels the service future; it does not add HTTP
+request draining. SIGKILL cannot flush telemetry.
+
+Metrics retain their upstream Prometheus format. Configure Datadog OpenMetrics
+scraping separately for API `:4000/metrics`, indexer `:8875/metrics`, and query
+tracker `:4001/metrics` with the example configs. Use a metric allowlist to control
+per-subscription/per-index cardinality. Keep the indexer's endpoint available to
+the query tracker, which consumes its gauges for database backpressure.
+Standalone snapshot jobs do not currently serve a metrics endpoint; snapshot
+metrics during indexer bootstrap are included in the indexer's registry.
+Migration/dbtools continue to use their existing console output, collected by
+the Datadog Agent. The local Grafana/Tempo/Prometheus Compose setup stays usable.
+
+Validate the isolated crate with `cargo test -p phoenix-telemetry`; its OTLP
+integration test uses a local collector and requires no Datadog credentials.
+
 ## Getting Started
 
 ### What You Need

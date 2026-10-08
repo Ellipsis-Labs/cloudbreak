@@ -15,7 +15,11 @@ authors = [
   "Mateusz Mroz",
 ]
 
+[features]
+phoenix-telemetry = ["dep:phoenix-telemetry", "cloudbreak-api/phoenix-telemetry"]
+
 [dependencies]
+phoenix-telemetry = { workspace = true, optional = true }
 cloudbreak-core = { workspace = true }
 cloudbreak-api = { workspace = true }
 cloudbreak-index = { workspace = true }

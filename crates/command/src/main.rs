@@ -17,6 +17,7 @@ use cloudbreak_query_tracker::run as run_query_tracker;
 use cloudbreak_snapshot::run as run_snapshot;
 
 mod hash_check;
+#[cfg(not(feature = "phoenix-telemetry"))]
 mod opentelemetry;
 
 #[cfg(not(target_env = "msvc"))]
@@ -55,8 +56,29 @@ pub enum Commands {
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
+    #[cfg(feature = "phoenix-telemetry")]
+    let _telemetry = phoenix_telemetry::init(
+        &args.config,
+        match &args.command {
+            Commands::Api => "cloudbreak-api",
+            Commands::Index => "cloudbreak-indexer",
+            Commands::Snapshot => "cloudbreak-snapshot",
+            Commands::QueryTracker => "cloudbreak-query-tracker",
+            Commands::SnapshotDiff(_) => "cloudbreak-snapshot-diff",
+        },
+    )?;
+    #[cfg(feature = "phoenix-telemetry")]
+    let _ = cloudbreak_core::LOG_FILTER_HANDLE.set(_telemetry.log_filter_handle.clone());
+    #[cfg(not(feature = "phoenix-telemetry"))]
     opentelemetry::init_tracer(&args.config);
 
+    #[cfg(feature = "phoenix-telemetry")]
+    return phoenix_telemetry::run_until_shutdown(run(args)).await;
+    #[cfg(not(feature = "phoenix-telemetry"))]
+    run(args).await
+}
+
+async fn run(args: Cli) -> Result<()> {
     match args.command {
         Commands::Api => run_api(&args.config).await,
         Commands::Index => run_index(&args.config).await,
