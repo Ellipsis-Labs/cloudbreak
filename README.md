@@ -89,25 +89,32 @@ The **cluster tracker** is a [Blockdaemon `solcluster tracker`](https://github.c
 toolchain pinned in `flake.lock` (the same inputs as Phoenix). Nix runs inside
 the builder, so local Nix installation is optional. Install Docker with Buildx,
 AWS CLI v2, and either Python 3.11+ or `uv`. Docker must be running with enough
-memory/disk for the Solana dependency build and support emulation when building
-the other architecture. The first build is expensive; subsequent builds reuse
-Nix layers and Cargo caches.
+memory/disk for the Solana dependency build. The compiler runs on Docker's native
+build platform; Nix cross-build shells target ARM64 or AMD64 explicitly, without
+running the compiler under QEMU. Both targets use dynamic glibc linking and
+include their target runtime libraries. Phoenix CI uses static musl linking;
+Cloudbreak uses dynamic glibc linking. The first build is expensive;
+subsequent builds reuse Nix layers and Cargo caches.
+
+Release builds use Phoenix CI's optimization settings: ThinLTO, 8 codegen
+units, optimization level 3, overflow checks, and stripped binaries. Panic
+unwinding stays enabled so Cloudbreak can recover from gRPC session panics.
 
 ```sh
 # Inspect the command without building or contacting AWS.
-python3 scripts/build_and_push_local.py --plan
+uv run --script scripts/build_and_push_local.py --plan
 
 # Build and load the local architecture, without contacting AWS or pushing.
-python3 scripts/build_and_push_local.py --dry-run
+uv run --script scripts/build_and_push_local.py --dry-run
 
 # Publish ARM64 and AMD64 to Ellipsis's ECR (select your authenticated profile).
-AWS_PROFILE=your-ellipsis-profile python3 scripts/build_and_push_local.py
+AWS_PROFILE=your-ellipsis-profile uv run --script scripts/build_and_push_local.py
 
 # Publish only ARM64.
-AWS_PROFILE=your-ellipsis-profile python3 scripts/build_and_push_local.py --arm-only
+AWS_PROFILE=your-ellipsis-profile uv run --script scripts/build_and_push_local.py --arm-only
 ```
 
-You can also run `uv run --script scripts/build_and_push_local.py`.
+The scripts declare their Python requirement inline and need no Python dependencies.
 The default registry is `829210487188.dkr.ecr.us-east-1.amazonaws.com`, and the
 single repository is `cloudbreak`. Every image contains `cloudbreak`,
 `cloudbreak-migration`, and `cloudbreak-dbtools` under `/usr/local/bin`.
@@ -152,7 +159,7 @@ deployment configuration remains separate.
 
 For native development, `nix develop path:.` provides the same build toolchain.
 Validate the local release script with
-`python3 -m unittest discover -s scripts -p 'test_build_and_push_local.py'`.
+`uv run --script scripts/test_build_and_push_local.py`.
 
 ## Production telemetry
 

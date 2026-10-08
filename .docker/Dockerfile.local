@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM nixos/nix:2.26.2@sha256:3bb728719e2c4e478df4c50b80f93adbe27d5c561d1417c3a2306eb914d910da AS builder
+FROM --platform=$BUILDPLATFORM nixos/nix:2.26.2@sha256:3bb728719e2c4e478df4c50b80f93adbe27d5c561d1417c3a2306eb914d910da AS builder
 
 RUN printf 'experimental-features = nix-command flakes\nsandbox = false\nfilter-syscalls = false\n' >> /etc/nix/nix.conf
 ENV CARGO_HOME=/cargo
@@ -7,22 +7,30 @@ ENV CARGO_TARGET_DIR=/build/target
 WORKDIR /build
 
 COPY flake.nix flake.lock /toolchain/
-RUN nix develop path:/toolchain --command true && \
-    nix build path:/toolchain#runtime --out-link /runtime
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      arm64) echo aarch64-linux > /target-system ;; \
+      amd64) echo x86_64-linux > /target-system ;; \
+      *) echo "Unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    nix develop "path:/toolchain#crossBuildShell-$(cat /target-system)" --command true && \
+    nix build "path:/toolchain#runtime-$(cat /target-system)" --out-link /runtime
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-ARG TARGETARCH
 RUN --mount=type=cache,target=/cargo/registry,id=cloudbreak-${TARGETARCH}-registry \
     --mount=type=cache,target=/cargo/git,id=cloudbreak-${TARGETARCH}-git \
     --mount=type=cache,target=/build/target,id=cloudbreak-${TARGETARCH}-target,sharing=locked \
-    nix develop path:/toolchain --command bash -euc \
-      'cargo build --locked --release --bin cloudbreak --bin cloudbreak-migration --bin cloudbreak-dbtools; \
+    nix develop "path:/toolchain#crossBuildShell-$(cat /target-system)" --command bash -euc \
+      'cargo build --target "$CARGO_BUILD_TARGET" --locked --release --bin cloudbreak --bin cloudbreak-migration --bin cloudbreak-dbtools; \
        mkdir -p /rootfs/usr/local/bin; \
        for binary in cloudbreak cloudbreak-migration cloudbreak-dbtools; do \
-         cp "$CARGO_TARGET_DIR/release/$binary" /rootfs/usr/local/bin/; \
-         strip "/rootfs/usr/local/bin/$binary"; \
-       done'
+         cp "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/$binary" /rootfs/usr/local/bin/; \
+         "$TARGET_STRIP" "/rootfs/usr/local/bin/$binary"; \
+         readelf -l "/rootfs/usr/local/bin/$binary" | \
+           sed -n "s/.*Requesting program interpreter: \(.*\)]/\1/p" >> /target-loaders; \
+       done; \
+       test "$(wc -l < /target-loaders)" -eq 3'
 
 RUN mkdir -p /rootfs/nix/store /rootfs/etc/ssl/certs /rootfs/tmp /rootfs/data && \
     chmod 1777 /rootfs/tmp && \
@@ -32,9 +40,12 @@ RUN mkdir -p /rootfs/nix/store /rootfs/etc/ssl/certs /rootfs/tmp /rootfs/data &&
     cp -L /runtime/etc/ssl/certs/ca-bundle.crt /rootfs/etc/ssl/certs/ca-certificates.crt && \
     printf 'root:x:0:0:root:/data:/sbin/nologin\n' > /rootfs/etc/passwd && \
     printf 'root:x:0:\n' > /rootfs/etc/group && \
-    for binary in cloudbreak cloudbreak-migration cloudbreak-dbtools; do \
-      chroot /rootfs "/usr/local/bin/$binary" --help >/dev/null || exit 1; \
-    done
+    while read -r loader; do test -f "/rootfs$loader" || exit 1; done < /target-loaders && \
+    if [ "$(uname -m)-linux" = "$(cat /target-system)" ]; then \
+      for binary in cloudbreak cloudbreak-migration cloudbreak-dbtools; do \
+        chroot /rootfs "/usr/local/bin/$binary" --help >/dev/null || exit 1; \
+      done; \
+    fi
 
 FROM scratch
 COPY --from=builder /rootfs /
