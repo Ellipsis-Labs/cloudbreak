@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+FROM nixos/nix:2.26.2@sha256:3bb728719e2c4e478df4c50b80f93adbe27d5c561d1417c3a2306eb914d910da AS builder
+
+RUN printf 'experimental-features = nix-command flakes\nsandbox = false\nfilter-syscalls = false\n' >> /etc/nix/nix.conf
+ENV CARGO_HOME=/cargo
+ENV CARGO_TARGET_DIR=/build/target
+WORKDIR /build
+
+COPY flake.nix flake.lock /toolchain/
+RUN nix develop path:/toolchain --command true && \
+    nix build path:/toolchain#runtime --out-link /runtime
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+ARG TARGETARCH
+RUN --mount=type=cache,target=/cargo/registry,id=cloudbreak-${TARGETARCH}-registry \
+    --mount=type=cache,target=/cargo/git,id=cloudbreak-${TARGETARCH}-git \
+    --mount=type=cache,target=/build/target,id=cloudbreak-${TARGETARCH}-target,sharing=locked \
+    nix develop path:/toolchain --command bash -euc \
+      'cargo build --locked --release --bin cloudbreak --bin cloudbreak-migration --bin cloudbreak-dbtools; \
+       mkdir -p /rootfs/usr/local/bin; \
+       for binary in cloudbreak cloudbreak-migration cloudbreak-dbtools; do \
+         cp "$CARGO_TARGET_DIR/release/$binary" /rootfs/usr/local/bin/; \
+         strip "/rootfs/usr/local/bin/$binary"; \
+       done'
+
+RUN mkdir -p /rootfs/nix/store /rootfs/etc/ssl/certs /rootfs/tmp /rootfs/data && \
+    chmod 1777 /rootfs/tmp && \
+    for path in $(nix-store --query --requisites /runtime); do \
+      cp -a "$path" /rootfs/nix/store/; \
+    done && \
+    cp -L /runtime/etc/ssl/certs/ca-bundle.crt /rootfs/etc/ssl/certs/ca-certificates.crt && \
+    printf 'root:x:0:0:root:/data:/sbin/nologin\n' > /rootfs/etc/passwd && \
+    printf 'root:x:0:\n' > /rootfs/etc/group && \
+    for binary in cloudbreak cloudbreak-migration cloudbreak-dbtools; do \
+      chroot /rootfs "/usr/local/bin/$binary" --help >/dev/null || exit 1; \
+    done
+
+FROM scratch
+COPY --from=builder /rootfs /
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV HOME=/data
+WORKDIR /data
+ENTRYPOINT ["/usr/local/bin/cloudbreak"]
