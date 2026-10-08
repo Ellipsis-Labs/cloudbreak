@@ -132,3 +132,17 @@ cloudbreak-core = { path = "crates/core" }
 cloudbreak-entity = { path = "crates/entity" }
 cloudbreak-query-tracker = { path = "crates/query-tracker" }
 phoenix-telemetry = { path = "crates/phoenix-telemetry" }
+
+[profile.release]
+codegen-units = 8
+lto = "thin"
+opt-level = 3
+overflow-checks = true
+strip = true
+# gRPC sessions catch panics and reconnect; preserve unwinding.
+panic = "unwind"
+
+[profile.release.build-override]
+codegen-units = 1
+incremental = false
+opt-level = 3
