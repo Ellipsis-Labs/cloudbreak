@@ -55,8 +55,30 @@ pub enum Commands {
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
-    opentelemetry::init_tracer(&args.config);
+    let _telemetry = phoenix_telemetry::init(
+        &args.config,
+        match &args.command {
+            Commands::Api => "cloudbreak-api",
+            Commands::Index => "cloudbreak-indexer",
+            Commands::Snapshot => "cloudbreak-snapshot",
+            Commands::QueryTracker => "cloudbreak-query-tracker",
+            Commands::SnapshotDiff(_) => "cloudbreak-snapshot-diff",
+        },
+    )?;
+    if let Some(telemetry) = &_telemetry {
+        let _ = cloudbreak_core::LOG_FILTER_HANDLE.set(telemetry.log_filter_handle.clone());
+    } else {
+        opentelemetry::init_tracer(&args.config);
+    }
 
+    if _telemetry.is_some() {
+        phoenix_telemetry::run_until_shutdown(run(args)).await
+    } else {
+        run(args).await
+    }
+}
+
+async fn run(args: Cli) -> Result<()> {
     match args.command {
         Commands::Api => run_api(&args.config).await,
         Commands::Index => run_index(&args.config).await,

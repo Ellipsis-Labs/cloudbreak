@@ -131,3 +131,4 @@ cloudbreak-index = { path = "crates/index" }
 cloudbreak-core = { path = "crates/core" }
 cloudbreak-entity = { path = "crates/entity" }
 cloudbreak-query-tracker = { path = "crates/query-tracker" }
+phoenix-telemetry = { path = "crates/phoenix-telemetry" }

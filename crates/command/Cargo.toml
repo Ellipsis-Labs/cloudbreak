@@ -16,6 +16,7 @@ authors = [
 ]
 
 [dependencies]
+phoenix-telemetry = { workspace = true }
 cloudbreak-core = { workspace = true }
 cloudbreak-api = { workspace = true }
 cloudbreak-index = { workspace = true }
