@@ -83,6 +83,77 @@ The **cluster tracker** is a [Blockdaemon `solcluster tracker`](https://github.c
 | `crates/dbtools/`           | `cloudbreak-dbtools`       | Standalone operator CLI for running analytics queries and toggling Postgres configuration across one or more servers. Does not depend on other cloudbreak crates. See [`crates/dbtools/README.md`](crates/dbtools/README.md).                                                                                                                               |
 | `crates/integration_tests/` | `integration_tests`                   | Black-box benchmarking and correctness testing tool. Constant-rate load generation, dual-endpoint comparison with slot compensation, VictoriaLogs integration, and optional DB forensics. See [`crates/integration_tests/README.md`](crates/integration_tests/README.md).                                                                                  |
 
+## Building production images for Ellipsis Labs
+
+`scripts/build_and_push_local.py` uses Docker Buildx to build with the Nix
+toolchain pinned in `flake.lock` (the same inputs as Phoenix). Nix runs inside
+the builder, so local Nix installation is optional. Install Docker with Buildx,
+AWS CLI v2, and either Python 3.11+ or `uv`. Docker must be running with enough
+memory/disk for the Solana dependency build and support emulation when building
+the other architecture. The first build is expensive; subsequent builds reuse
+Nix layers and Cargo caches.
+
+```sh
+# Inspect the command without building or contacting AWS.
+python3 scripts/build_and_push_local.py --plan
+
+# Build and load the local architecture, without contacting AWS or pushing.
+python3 scripts/build_and_push_local.py --dry-run
+
+# Publish ARM64 and AMD64 to Ellipsis's ECR (select your authenticated profile).
+AWS_PROFILE=your-ellipsis-profile python3 scripts/build_and_push_local.py
+
+# Publish only ARM64.
+AWS_PROFILE=your-ellipsis-profile python3 scripts/build_and_push_local.py --arm-only
+```
+
+You can also run `uv run --script scripts/build_and_push_local.py`.
+The default registry is `829210487188.dkr.ecr.us-east-1.amazonaws.com`, and the
+single repository is `cloudbreak`. Every image contains `cloudbreak`,
+`cloudbreak-migration`, and `cloudbreak-dbtools` under `/usr/local/bin`.
+`AWS_REGION` (or `AWS_DEFAULT_REGION`),
+`AWS_ACCOUNT_ID`, and `--repository` override those defaults. The script verifies
+that your AWS credentials belong to the target account, creates a missing ECR
+repository with immutable tags and scan-on-push, authenticates Docker, and prints
+the full image URI after pushing. Your role needs STS identity access and ECR
+describe/create repository, authentication, and image upload permissions; see
+[AWS's ECR guide](https://docs.aws.amazon.com/AmazonECR/latest/userguide/getting-started-cli.html).
+
+Tags contain a UTC timestamp, Git commit SHA, and HEAD tree hash. Uncommitted or
+untracked files add `-dirty`; `--dev` adds a `dev-` prefix. Builds include the
+current working tree, use `Cargo.lock`, and never reuse an image by HEAD hash.
+The Docker context includes only Rust source and build manifests; local configs,
+credentials, database files, and the host `target` directory are excluded.
+
+The `cloudbreak` image serves all four service roles. Deploy the printed URI from
+ECR and pass the appropriate command, mounting the production config separately:
+
+```sh
+IMAGE_URI="paste-the-image-uri-printed-by-the-build-script"
+docker run --rm -v "$PWD/cloudbreak.api.toml:/etc/cloudbreak/config.toml:ro" \
+  -p 4000:4000 "$IMAGE_URI" --config /etc/cloudbreak/config.toml api
+# Other commands: index, snapshot, query-tracker.
+
+# Run the other binaries from the same image (provide their config/environment).
+docker run --rm -e DATABASE_URL \
+  --entrypoint /usr/local/bin/cloudbreak-migration "$IMAGE_URI" up
+docker run --rm -v "$PWD/cloudbreak.dbtools.toml:/etc/cloudbreak/dbtools.toml:ro" \
+  --entrypoint /usr/local/bin/cloudbreak-dbtools "$IMAGE_URI" \
+  --config /etc/cloudbreak/dbtools.toml analytics --help
+```
+
+For the indexer/snapshot loader, mount writable storage at the paths configured
+for snapshot downloads/extraction. The default entrypoint is
+`/usr/local/bin/cloudbreak`; select either operational binary with Docker's
+`--entrypoint`, Kubernetes `command`, or ECS `entryPoint`. The image contains
+all three executables, Nix runtime libraries, and CA
+certificates; they have no shell. This script publishes images; production
+deployment configuration remains separate.
+
+For native development, `nix develop path:.` provides the same build toolchain.
+Validate the local release script with
+`python3 -m unittest discover -s scripts -p 'test_build_and_push_local.py'`.
+
 ## Getting Started
 
 ### What You Need
