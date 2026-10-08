@@ -1,6 +1,10 @@
 //! Phoenix-compatible telemetry at the fork boundary; upstream instrumentation stays intact.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use opentelemetry::{KeyValue, trace::TracerProvider};
@@ -17,6 +21,47 @@ use tracing_subscriber::{
 };
 
 mod log;
+
+static PHOENIX_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Backend {
+    Phoenix,
+    Upstream,
+}
+
+fn select_backend(contents: &str, env: impl Fn(&str) -> Option<String>) -> Result<Backend> {
+    let table: toml::Value = toml::from_str(contents).context("Invalid service TOML")?;
+    if let Some(backend) = table
+        .get("tracing")
+        .and_then(|section| section.get("backend"))
+    {
+        return backend
+            .clone()
+            .try_into()
+            .context("[tracing].backend must be phoenix or upstream");
+    }
+    let phoenix_configured = [
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "TRACING_LOG_FORMAT",
+        "RUST_TRACING",
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "OTEL_SERVICE_NAME",
+        "OTEL_TRACES_SAMPLER_ARG",
+        "OTEL_SDK_DISABLED",
+        "DD_ENV",
+        "DD_VERSION",
+    ]
+    .iter()
+    .any(|name| env(name).is_some());
+    Ok(if phoenix_configured {
+        Backend::Phoenix
+    } else {
+        Backend::Upstream
+    })
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -149,12 +194,17 @@ impl Drop for TelemetryGuard {
     }
 }
 
-pub fn init(path: &str, service: &str) -> Result<TelemetryGuard> {
+/// Select Phoenix from runtime configuration, or let the caller initialize upstream.
+pub fn init(path: &str, service: &str) -> Result<Option<TelemetryGuard>> {
     let contents =
         std::fs::read_to_string(path).context("Read service configuration for telemetry")?;
+    if select_backend(&contents, |name| std::env::var(name).ok())? == Backend::Upstream {
+        return Ok(None);
+    }
     init_config(Config::load(&contents, service, |name| {
         std::env::var(name).ok()
     })?)
+    .map(Some)
 }
 
 fn init_config(config: Config) -> Result<TelemetryGuard> {
@@ -230,6 +280,7 @@ fn init_config(config: Config) -> Result<TelemetryGuard> {
     if let Some(provider) = &guard.provider {
         opentelemetry::global::set_tracer_provider(provider.clone());
     }
+    PHOENIX_ACTIVE.store(true, Ordering::Relaxed);
     Ok(guard)
 }
 
@@ -245,6 +296,9 @@ impl opentelemetry::propagation::Extractor for Headers<'_> {
 
 /// Attach the caller's W3C context before entering and starting the request span.
 pub fn attach_parent(span: &tracing::Span, headers: &hyper::HeaderMap) {
+    if !PHOENIX_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
     let context = opentelemetry::global::get_text_map_propagator(|p| p.extract(&Headers(headers)));
     let _ = span.set_parent(context);
 }

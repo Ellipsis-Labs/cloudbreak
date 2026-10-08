@@ -18,6 +18,29 @@ fn config(toml: &str, vars: &[(&str, &str)]) -> Result<Config> {
 }
 
 #[test]
+fn runtime_configuration_selects_backend() {
+    assert_eq!(select_backend("", |_| None).unwrap(), Backend::Upstream);
+    assert_eq!(
+        select_backend("", |name| (name == "OTEL_EXPORTER_OTLP_ENDPOINT")
+            .then(|| "http://agent:4317".into()))
+        .unwrap(),
+        Backend::Phoenix
+    );
+    assert_eq!(
+        select_backend("[tracing]\nbackend='phoenix'", |_| None).unwrap(),
+        Backend::Phoenix
+    );
+    assert_eq!(
+        select_backend("[tracing]\nbackend='upstream'", |_| Some(
+            "configured".into()
+        ))
+        .unwrap(),
+        Backend::Upstream
+    );
+    assert!(select_backend("[tracing]\nbackend='invalid'", |_| None).is_err());
+}
+
+#[test]
 fn phoenix_environment_enables_export_and_overrides_local_endpoint() {
     let config = config(
         "[tracing]\nendpoint='http://localhost:4317'",

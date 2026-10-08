@@ -75,12 +75,9 @@ impl HttpServer {
 
                     *requests_in_connection.lock().unwrap() += 1;
 
-                    #[cfg(feature = "phoenix-telemetry")]
                     let span = tracing::info_span!(parent: None, "http_request", json_bytes = tracing::field::Empty);
-                    #[cfg(feature = "phoenix-telemetry")]
                     phoenix_telemetry::attach_parent(&span, req.headers());
                     let request = async move { handle_request(req, state, header_keys).await };
-                    #[cfg(feature = "phoenix-telemetry")]
                     let request = request.instrument(span);
                     request
                 });
@@ -113,7 +110,6 @@ impl HttpServer {
     }
 }
 
-#[cfg_attr(not(feature = "phoenix-telemetry"), tracing::instrument(name = "http_request", parent = None, skip_all, fields(json_bytes = tracing::field::Empty)))]
 async fn handle_request(
     req: Request<Incoming>,
     state: Arc<CloudbreakRpcState>,

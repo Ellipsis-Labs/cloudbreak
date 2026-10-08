@@ -15,11 +15,8 @@ authors = [
   "Mateusz Mroz",
 ]
 
-[features]
-phoenix-telemetry = ["dep:phoenix-telemetry"]
-
 [dependencies]
-phoenix-telemetry = { workspace = true, optional = true }
+phoenix-telemetry = { workspace = true }
 rustls = { workspace = true }
 cloudbreak-core = { workspace = true }
 serde = { workspace = true }

@@ -156,10 +156,19 @@ Validate the local release script with
 
 ## Production telemetry
 
-The unified Docker image enables the `cloudbreak/phoenix-telemetry` feature.
-The fork-specific implementation lives in `crates/phoenix-telemetry`; builds
-without that feature retain the upstream telemetry initializer. Native builds
-can opt in with `cargo run -p cloudbreak --features phoenix-telemetry -- ...`.
+Telemetry selection happens at runtime in both Docker and native builds.
+Phoenix's telemetry environment variables select the implementation in
+`crates/phoenix-telemetry`; without them, Cloudbreak uses its upstream initializer.
+You can explicitly select either path in the service TOML:
+
+```toml
+[tracing]
+backend = "phoenix" # or "upstream" to ignore Phoenix environment configuration
+enabled = true
+endpoint = "http://localhost:4317"
+```
+
+The explicit `backend` setting takes precedence over environment-based selection.
 
 Use the same environment configuration as Phoenix's production services:
 
