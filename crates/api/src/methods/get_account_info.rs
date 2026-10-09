@@ -38,7 +38,9 @@ pub async fn get_account_info(
     if let Some(min_context_slot) = config.min_context_slot
         && latest_slot < min_context_slot
     {
-        return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
+        return Err(RpcError::MinContextSlotNotReached {
+            context_slot: latest_slot,
+        });
     }
 
     let encoding = config.encoding.unwrap_or(UiAccountEncoding::Binary);
@@ -77,7 +79,10 @@ pub async fn get_account_info(
     let owner = account.owner;
 
     // Post-query indexer-filter check: if this owner is excluded by the current indexer filter error.
-    if !state.indexer_filter.is_account_selected(&pubkey, &owner) {
+    if !state
+        .indexer_filter
+        .is_account_selected(&pubkey, &owner, &account.data)
+    {
         return Err(RpcError::AccountOwnerExcluded {
             pubkey: pubkey.to_string(),
             owner: owner.to_string(),

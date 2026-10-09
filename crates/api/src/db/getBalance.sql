@@ -16,6 +16,7 @@ all_versions AS (
     SELECT
         accounts.owner,
         accounts.lamports,
+        SUBSTRING(accounts.data FROM 1 FOR 166) AS data,
         accounts.slot
     FROM accounts, latest_slot
     WHERE
@@ -25,6 +26,7 @@ all_versions AS (
     SELECT
         snapshot_accounts.owner,
         snapshot_accounts.lamports,
+        SUBSTRING(snapshot_accounts.data FROM 1 FOR 166) AS data,
         snapshot_accounts.slot
     FROM snapshot_accounts, latest_slot
     WHERE
@@ -35,7 +37,8 @@ all_versions AS (
 latest_account AS (
     SELECT
         owner,
-        lamports
+        lamports,
+        data
     FROM all_versions
     ORDER BY slot DESC
     LIMIT 1
@@ -44,6 +47,7 @@ latest_account AS (
 SELECT
     latest_slot.slot AS context_slot,
     latest_account.owner,
-    latest_account.lamports
+    latest_account.lamports,
+    latest_account.data
 FROM latest_slot
 LEFT JOIN latest_account ON TRUE;

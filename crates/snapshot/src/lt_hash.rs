@@ -45,7 +45,9 @@ fn for_each_deduplicated_snapshot_account(
 
     // When `include` is non-empty the first pass narrows to that set, keeping
     // version_map bounded. Otherwise we can't safely narrow here.
-    let first_pass_filter = !programs.include.is_empty();
+    let first_pass_filter = !programs.include.is_empty()
+        && programs.accounts.is_empty()
+        && programs.token_mint_filters.is_empty();
 
     let total_files = snapshot_files.len();
     let log_every = (total_files / 10).max(1);
@@ -130,7 +132,9 @@ fn for_each_deduplicated_snapshot_account(
                 }
 
                 let owner_pubkey = Pubkey::from(account.owner.to_bytes());
-                if !programs.is_program_selected(&owner_pubkey) {
+                if !programs.is_account_selected(
+                    &Pubkey::new_from_array(pubkey_bytes), &owner_pubkey, account.data,
+                ) {
                     return;
                 }
 
@@ -230,7 +234,7 @@ pub fn compute_snapshot_lt_hash_filtered_single_pass(
                     return;
                 }
                 live_total += 1;
-                if programs.is_program_selected(&Pubkey::from(account.owner.to_bytes()))
+                if programs.is_account_selected(account.pubkey(), account.owner, account.data)
                     == exclude_mode
                 {
                     return;

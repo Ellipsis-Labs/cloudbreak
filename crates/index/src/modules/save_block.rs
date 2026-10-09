@@ -108,7 +108,10 @@ pub async fn save_block(
         }
 
         let owner = Pubkey::try_from(account.owner.as_slice()).expect("valid account owner");
-        let is_new_owner_included = config.programs.is_account_selected(&pubkey, &owner);
+        let is_new_owner_included =
+            config
+                .programs
+                .is_account_selected(&pubkey, &owner, &account.data);
 
         if accounts_owner_map.account_to_be_deleted(
             &account.pubkey,

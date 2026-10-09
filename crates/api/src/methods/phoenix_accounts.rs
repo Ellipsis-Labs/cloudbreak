@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use cloudbreak_core::modules::account_snapshot::{
     AccountSnapshot, MAX_SNAPSHOT_BYTES, ProgramAccounts, SnapshotAccount, encode_snapshot,
 };
-use cloudbreak_core::{PhoenixAccountsConfig, PubkeyDef};
+use cloudbreak_core::{AccountSelectorConfig, PhoenixAccountsConfig, PubkeyDef, TokenMintFilter};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::sqlx::{self, Row};
@@ -38,6 +38,9 @@ pub struct GetPhoenixAccountsConfig {
     /// Extra fully indexed programs to include at the same confirmed-slot boundary.
     #[serde(default)]
     pub additional_program_ids: Vec<PubkeyDef>,
+    /// Additional already indexed token-holder sets, read at this checkpoint.
+    #[serde(default)]
+    pub token_mint_filters: Vec<TokenMintFilter>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +107,52 @@ fn request_programs(
     Ok(programs)
 }
 
+fn request_mint_filters(
+    config: &PhoenixAccountsConfig,
+    additional: &[TokenMintFilter],
+    indexer_filter: &AccountSelectorConfig,
+) -> Result<Vec<TokenMintFilter>, RpcError> {
+    if additional.len() > 64 {
+        return Err(RpcError::InvalidParamsWithMessage(
+            "At most 64 tokenMintFilters are supported".into(),
+        ));
+    }
+    let filters: Vec<_> = config
+        .token_mint_filters
+        .iter()
+        .chain(additional)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for filter in &filters {
+        filter
+            .validate()
+            .map_err(|e| RpcError::InvalidParamsWithMessage(e.to_string()))?;
+        if !indexer_filter.covers_token_mint(filter) {
+            return Err(RpcError::KeyExcludedFromSecondaryIndex {
+                key: filter.mint.0.to_string(),
+            });
+        }
+    }
+    Ok(filters)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct SnapshotSelection {
+    programs: Vec<Pubkey>,
+    token_mint_filters: Vec<TokenMintFilter>,
+}
+
+impl From<Vec<Pubkey>> for SnapshotSelection {
+    fn from(programs: Vec<Pubkey>) -> Self {
+        Self {
+            programs,
+            ..Default::default()
+        }
+    }
+}
+
 pub fn validate_config(
     config: &PhoenixAccountsConfig,
     state: &CloudbreakRpcState,
@@ -136,6 +185,7 @@ pub fn validate_config(
             });
         }
     }
+    request_mint_filters(config, &[], &state.indexer_filter)?;
     for key in &config.vault_accounts {
         if !state.indexer_filter.accounts.iter().any(|p| p.0 == key.0) {
             return Err(RpcError::InvalidParamsWithMessage(format!(
@@ -149,23 +199,53 @@ pub fn validate_config(
 
 const CHECKPOINT_SQL: &str = "SELECT c.slot, c.transaction_count, c.blockhash FROM atomic_account_checkpoint c JOIN slots s ON s.commitment = 1 AND s.slot = c.slot JOIN service_health h ON h.id = 1 WHERE c.id = 1 AND s.health AND h.healthy AND NOT EXISTS (SELECT 1 FROM slots f WHERE f.commitment = 2 AND f.slot > c.slot)";
 
+// Find eligible keys with the existing owner/key/mint indexes, then choose their latest
+// version without filtering its owner or mint: closures/reinitialization must mask old balances.
 const ACCOUNTS_SQL: &str = r#"
-WITH versions AS (
+WITH candidates AS MATERIALIZED (
+    SELECT pubkey FROM accounts WHERE slot <= $3 AND (
+        owner = ANY($1) OR pubkey = ANY($2)
+        OR (owner = ANY($4) AND token_mint = ANY($5) AND
+            owner IN ('\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea,
+                      '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)))
+    UNION
+    SELECT pubkey FROM snapshot_accounts WHERE slot <= $3 AND (
+        owner = ANY($1) OR pubkey = ANY($2)
+        OR (owner = ANY($4) AND token_mint = ANY($5) AND
+            owner IN ('\x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9'::bytea,
+                      '\x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc'::bytea)))
+), versions AS (
     SELECT pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version
-    FROM accounts WHERE slot <= $3 AND (owner = ANY($1) OR pubkey = ANY($2))
+    FROM accounts WHERE slot <= $3 AND pubkey IN (SELECT pubkey FROM candidates)
     UNION ALL
     SELECT pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version
-    FROM snapshot_accounts WHERE slot <= $3 AND (owner = ANY($1) OR pubkey = ANY($2))
+    FROM snapshot_accounts WHERE slot <= $3 AND pubkey IN (SELECT pubkey FROM candidates)
 ), latest AS (
     SELECT DISTINCT ON (pubkey) * FROM versions ORDER BY pubkey, slot DESC, write_version DESC, lamports DESC
 )
 SELECT pubkey, owner, lamports, executable, rent_epoch, data FROM latest WHERE lamports > 0 ORDER BY pubkey
 "#;
 
+fn account_requested(
+    selection: &SnapshotSelection,
+    keys: &[PubkeyDef],
+    pubkey: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+) -> bool {
+    selection.programs.binary_search(owner).is_ok()
+        || keys.iter().any(|key| key.0 == *pubkey)
+        || cloudbreak_core::modules::token_mint_filter::matches_token_mint_filters(
+            &selection.token_mint_filters,
+            owner,
+            data,
+        )
+}
+
 type SharedBuild = Result<(Arc<PhoenixAccountsResponse>, GpaMetricsData), Arc<RpcError>>;
 
 struct SnapshotRequest {
-    programs: Vec<Pubkey>,
+    selection: SnapshotSelection,
     build: BoxFuture<'static, SharedBuild>,
     reply: oneshot::Sender<SharedBuild>,
 }
@@ -179,7 +259,7 @@ pub struct SnapshotWorker {
 impl SnapshotWorker {
     async fn resolve(
         &self,
-        programs: Vec<Pubkey>,
+        selection: impl Into<SnapshotSelection>,
         build: BoxFuture<'static, SharedBuild>,
     ) -> SharedBuild {
         let sender = self.sender.get_or_init(|| {
@@ -190,7 +270,7 @@ impl SnapshotWorker {
         let (reply, receiver) = oneshot::channel();
         sender
             .send(SnapshotRequest {
-                programs,
+                selection: selection.into(),
                 build,
                 reply,
             })
@@ -202,7 +282,8 @@ impl SnapshotWorker {
     }
 
     async fn run(mut receiver: mpsc::Receiver<SnapshotRequest>) {
-        let mut waiters: BTreeMap<Vec<Pubkey>, Vec<oneshot::Sender<SharedBuild>>> = BTreeMap::new();
+        let mut waiters: BTreeMap<SnapshotSelection, Vec<oneshot::Sender<SharedBuild>>> =
+            BTreeMap::new();
         let mut jobs = FuturesUnordered::new();
         let mut accepting = true;
         loop {
@@ -215,7 +296,7 @@ impl SnapshotWorker {
                 request = receiver.recv(), if accepting => {
                     let Some(request) = request else { accepting = false; continue; };
                     if request.reply.is_closed() { continue; }
-                    let key = request.programs;
+                    let key = request.selection;
                     let subscribers = waiters.entry(key.clone()).or_default();
                     if subscribers.is_empty() {
                         let job = tokio::spawn(request.build);
@@ -256,14 +337,21 @@ pub async fn get_phoenix_accounts(
         &request.additional_program_ids,
         &state.indexer_filter,
     )?;
-    let build_programs = programs.clone();
+    let mut token_mint_filters =
+        request_mint_filters(config, &request.token_mint_filters, &state.indexer_filter)?;
+    token_mint_filters.retain(|filter| programs.binary_search(&filter.token_program.0).is_err());
+    let selection = SnapshotSelection {
+        programs,
+        token_mint_filters,
+    };
+    let build_selection = selection.clone();
     let build_state = state.clone();
     let result = state
         .phoenix_snapshots
         .resolve(
-            programs,
+            selection,
             Box::pin(async move {
-                build_snapshot(&build_state, build_programs)
+                build_snapshot(&build_state, build_selection)
                     .await
                     .map(|(response, metrics)| (Arc::new(response), metrics))
                     .map_err(Arc::new)
@@ -294,7 +382,7 @@ fn validate_min_context_slot(slot: u64, minimum: Option<u64>) -> Result<(), RpcE
 
 async fn build_snapshot(
     state: &CloudbreakRpcState,
-    programs: Vec<Pubkey>,
+    selection: SnapshotSelection,
 ) -> Result<(PhoenixAccountsResponse, GpaMetricsData), RpcError> {
     let config = state
         .phoenix_accounts
@@ -337,14 +425,23 @@ async fn build_snapshot(
             blockhash: hash,
             programs: Vec::new(),
         };
-        let mut groups: BTreeMap<[u8; 32], Vec<SnapshotAccount>> = programs
+        let mut groups: BTreeMap<[u8; 32], Vec<SnapshotAccount>> = selection
+            .programs
             .iter()
+            .copied()
+            .chain(
+                selection
+                    .token_mint_filters
+                    .iter()
+                    .map(|f| f.token_program.0),
+            )
             .map(|p| (p.to_bytes(), Vec::new()))
             .collect();
         let mut bytes = 0usize;
         let mut rows = sqlx::query(ACCOUNTS_SQL)
             .bind(
-                programs
+                selection
+                    .programs
                     .iter()
                     .map(|p| p.to_bytes().to_vec())
                     .collect::<Vec<_>>(),
@@ -355,14 +452,24 @@ async fn build_snapshot(
                     .collect::<Vec<_>>(),
             )
             .bind(slot)
+            .bind(
+                selection
+                    .token_mint_filters
+                    .iter()
+                    .map(|f| f.token_program.0.to_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                selection
+                    .token_mint_filters
+                    .iter()
+                    .map(|f| f.mint.0.to_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
             .fetch(&mut *transaction);
         while let Some(row) = rows.next().await {
             let row = row?;
             let data: Vec<u8> = row.try_get("data")?;
-            bytes = bytes.saturating_add(data.len()).saturating_add(128);
-            if bytes > MAX_SNAPSHOT_BYTES {
-                return Err(sqlx::Error::Protocol("snapshot exceeds size limit".into()));
-            }
             let key: Vec<u8> = row.try_get("pubkey")?;
             let owner: Vec<u8> = row.try_get("owner")?;
             let pubkey = key
@@ -371,6 +478,19 @@ async fn build_snapshot(
             let owner = owner
                 .try_into()
                 .map_err(|_| sqlx::Error::Protocol("invalid owner".into()))?;
+            if !account_requested(
+                &selection,
+                &keys,
+                &Pubkey::new_from_array(pubkey),
+                &Pubkey::new_from_array(owner),
+                &data,
+            ) {
+                continue;
+            }
+            bytes = bytes.saturating_add(data.len()).saturating_add(128);
+            if bytes > MAX_SNAPSHOT_BYTES {
+                return Err(sqlx::Error::Protocol("snapshot exceeds size limit".into()));
+            }
             let rent: rust_decimal::Decimal = row.try_get("rent_epoch")?;
             groups.entry(owner).or_default().push(SnapshotAccount {
                 pubkey,
@@ -513,7 +633,7 @@ mod tests {
                 .get()
                 .unwrap()
                 .send(SnapshotRequest {
-                    programs: vec![Pubkey::new_from_array([1; 32])],
+                    selection: vec![Pubkey::new_from_array([1; 32])].into(),
                     reply,
                     build: Box::pin(async move {
                         builds.fetch_add(1, Ordering::SeqCst);
@@ -699,6 +819,81 @@ mod tests {
     }
 
     #[test]
+    fn caller_mint_filters_require_exact_coverage_and_normalize_coalescing_keys() {
+        use cloudbreak_core::modules::token_mint_filter::{
+            TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
+        };
+        let first = TokenMintFilter {
+            mint: PubkeyDef(Pubkey::new_unique()),
+            token_program: PubkeyDef(TOKEN_PROGRAM_ID),
+        };
+        let second = TokenMintFilter {
+            mint: PubkeyDef(Pubkey::new_unique()),
+            ..first.clone()
+        };
+        let config = PhoenixAccountsConfig {
+            token_mint_filters: vec![first.clone()],
+            ..Default::default()
+        };
+        let indexer = AccountSelectorConfig {
+            include: vec![PubkeyDef(Pubkey::new_unique())],
+            token_mint_filters: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        let a = request_mint_filters(
+            &config,
+            &[second.clone(), first.clone(), second.clone()],
+            &indexer,
+        )
+        .unwrap();
+        let b = request_mint_filters(&config, std::slice::from_ref(&second), &indexer).unwrap();
+        assert_eq!(a, b);
+        let wrong_program = TokenMintFilter {
+            token_program: PubkeyDef(TOKEN_2022_PROGRAM_ID),
+            ..first.clone()
+        };
+        assert!(matches!(
+            request_mint_filters(&config, &[wrong_program], &indexer),
+            Err(RpcError::KeyExcludedFromSecondaryIndex { .. })
+        ));
+        assert!(request_mint_filters(&config, &vec![first.clone(); 65], &indexer).is_err());
+        let config = PhoenixAccountsConfig::default();
+        let exact_only = AccountSelectorConfig {
+            accounts: vec![first.mint.clone()],
+            token_mint_filters: vec![],
+            ..indexer.clone()
+        };
+        assert!(!exact_only.covers_token_mint(&first));
+        assert!(
+            request_mint_filters(
+                &config,
+                &[TokenMintFilter {
+                    token_program: PubkeyDef(Pubkey::new_unique()),
+                    ..first.clone()
+                }],
+                &indexer
+            )
+            .is_err()
+        );
+        let parsed: GetPhoenixAccountsConfig = serde_json::from_value(
+            serde_json::json!({"tokenMintFilters":[{"mint": first.mint.0.to_string()}]}),
+        )
+        .unwrap();
+        assert_eq!(parsed.token_mint_filters, vec![first.clone()]);
+        let programs = vec![Pubkey::new_unique()];
+        assert_ne!(
+            SnapshotSelection {
+                programs: programs.clone(),
+                token_mint_filters: vec![first]
+            },
+            SnapshotSelection {
+                programs,
+                token_mint_filters: vec![second]
+            }
+        );
+    }
+
+    #[test]
     fn missing_or_invalid_vaults_fail_closed() {
         let key = PubkeyDef(Pubkey::new_from_array([1; 32]));
         let mut snapshot = AccountSnapshot {
@@ -727,6 +922,187 @@ mod tests {
         assert!(validate_vaults(&snapshot, &[key]).is_err());
     }
 
+    #[tokio::test]
+    #[ignore = "requires a disposable local PostgreSQL database"]
+    async fn token_mint_snapshot_excludes_stale_closed_and_reinitialized_accounts() {
+        use crate::modules::{
+            cache::GpaProcessor, supply_cache::SupplySnapshot, vote_accounts_cache::StakesSnapshot,
+        };
+        use cloudbreak_core::modules::{
+            account_snapshot::decode_snapshot,
+            processed::ProcessedAccounts,
+            token_mint_filter::{TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID},
+        };
+        use cloudbreak_core::{
+            MethodSection, ProcessedCommitmentBehavior, UnhealthyResponseBehavior,
+        };
+        use std::{sync::RwLock, time::Duration};
+
+        let url = std::env::var("CLOUDBREAK_TEST_DATABASE_URL").unwrap();
+        let bootstrap = sqlx::PgPool::connect(&url).await.unwrap();
+        let schema = format!("mint_snapshot_{}", std::process::id());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&bootstrap)
+            .await
+            .unwrap();
+        let mut options = sea_orm::ConnectOptions::new(url);
+        options
+            .max_connections(2)
+            .set_schema_search_path(schema.clone());
+        let db = sea_orm::Database::connect(options).await.unwrap();
+        let pool = db.get_postgres_connection_pool().clone();
+        sqlx::raw_sql("CREATE TABLE slots (slot bigint, commitment int, health bool); CREATE TABLE service_health (id int, healthy bool); CREATE TABLE atomic_account_checkpoint (id int, slot bigint, transaction_count bigint, blockhash text); CREATE TABLE accounts (pubkey bytea, owner bytea, lamports bigint, slot bigint, executable bool, rent_epoch numeric, data bytea, write_version bigint DEFAULT 0, token_mint bytea GENERATED ALWAYS AS (SUBSTRING(data FROM 1 FOR 32)) STORED); CREATE TABLE snapshot_accounts (LIKE accounts INCLUDING GENERATED); INSERT INTO slots VALUES (100,1,true); INSERT INTO service_health VALUES (1,true); INSERT INTO atomic_account_checkpoint VALUES (1,100,3,'hash100');").execute(&pool).await.unwrap();
+        let key = |n| Pubkey::new_from_array([n; 32]);
+        let mint_a = key(101);
+        let mint_b = key(102);
+        let phoenix = key(100);
+        let filters = vec![
+            TokenMintFilter {
+                mint: PubkeyDef(mint_a),
+                token_program: PubkeyDef(TOKEN_PROGRAM_ID),
+            },
+            TokenMintFilter {
+                mint: PubkeyDef(mint_b),
+                token_program: PubkeyDef(TOKEN_2022_PROGRAM_ID),
+            },
+        ];
+        for (id, owner, mint, slot, lamports) in [
+            (1, phoenix, mint_a, 90, 1),
+            (2, TOKEN_PROGRAM_ID, mint_b, 90, 1), // required vault, outside mint filters
+            (3, TOKEN_PROGRAM_ID, mint_a, 90, 1),
+            (3, TOKEN_PROGRAM_ID, mint_b, 100, 2), // reinitialized, same token owner
+            (4, TOKEN_PROGRAM_ID, mint_a, 90, 1),
+            (4, Pubkey::default(), mint_a, 100, 0), // closed, system owner
+            (5, TOKEN_PROGRAM_ID, mint_a, 90, 1),
+            (5, Pubkey::default(), mint_a, 100, 2), // left token program
+            (6, TOKEN_PROGRAM_ID, mint_a, 90, 1),
+            (6, TOKEN_PROGRAM_ID, mint_a, 101, 2), // future write must be excluded
+            (7, TOKEN_PROGRAM_ID, mint_b, 100, 1), // wrong program/mint pair
+            (8, TOKEN_2022_PROGRAM_ID, mint_b, 100, 1),
+            (9, TOKEN_2022_PROGRAM_ID, mint_a, 100, 1), // wrong program/mint pair
+            (10, TOKEN_PROGRAM_ID, mint_a, 100, 1),
+        ] {
+            let mut data = vec![0; 165];
+            data[..32].copy_from_slice(mint.as_ref());
+            data[108] = 1;
+            let table = if slot == 90 {
+                "snapshot_accounts"
+            } else {
+                "accounts"
+            };
+            sqlx::query(&format!("INSERT INTO {table} (pubkey,owner,lamports,slot,executable,rent_epoch,data) VALUES ($1,$2,$3,$4,false,0,$5)"))
+                .bind(key(id).to_bytes().to_vec()).bind(owner.to_bytes().to_vec())
+                .bind(lamports as i64).bind(slot as i64).bind(data).execute(&pool).await.unwrap();
+        }
+        let mut state = CloudbreakRpcState::new(
+            db,
+            Duration::from_secs(10),
+            None,
+            None,
+            Arc::new(AccountSelectorConfig {
+                include: vec![PubkeyDef(phoenix)],
+                accounts: vec![PubkeyDef(key(2))],
+                token_mint_filters: filters.clone(),
+                ..Default::default()
+            }),
+            1,
+            None,
+            Duration::from_secs(10),
+            ProcessedCommitmentBehavior::default(),
+            UnhealthyResponseBehavior::default(),
+            GpaProcessor::new(None),
+            "genesis".into(),
+            false,
+            Arc::new(RwLock::new(Arc::new(StakesSnapshot::empty()))),
+            100,
+            false,
+            false,
+            Arc::new(RwLock::new(Arc::new(SupplySnapshot::default()))),
+            MethodSection::default(),
+            MethodSection::default(),
+            ProcessedAccounts::default(),
+        );
+        state.phoenix_accounts = Some(PhoenixAccountsConfig {
+            enabled: true,
+            program_ids: vec![PubkeyDef(phoenix)],
+            vault_accounts: vec![PubkeyDef(key(2))],
+            ..Default::default()
+        });
+        let request = || GetPhoenixAccountsConfig {
+            token_mint_filters: filters.clone(),
+            ..Default::default()
+        };
+        let (one, two) = tokio::join!(
+            get_phoenix_accounts(&state, request()),
+            get_phoenix_accounts(&state, request())
+        );
+        let response = one.unwrap().0;
+        assert!(Arc::ptr_eq(&response, &two.unwrap().0));
+        assert_eq!(response.context.slot, 100);
+        assert_eq!(response.context.slot_index, Some(2));
+        let snapshot = decode_snapshot(&STANDARD.decode(&response.data).unwrap()).unwrap();
+        let mut accounts: Vec<_> = snapshot.programs.iter().flat_map(|p| &p.accounts).collect();
+        accounts.sort_by_key(|account| account.pubkey);
+        assert_eq!(
+            accounts.iter().map(|a| a.pubkey).collect::<Vec<_>>(),
+            [1, 2, 6, 8, 10].map(|n| key(n).to_bytes())
+        );
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|a| a.pubkey == key(6).to_bytes())
+                .unwrap()
+                .lamports,
+            1
+        );
+        assert!(
+            snapshot
+                .programs
+                .iter()
+                .all(|p| p.accounts.iter().all(|a| a.owner == p.program_id))
+        );
+        assert_eq!(response.account_count, 5);
+        assert!(matches!(
+            get_phoenix_accounts(
+                &state,
+                GetPhoenixAccountsConfig {
+                    additional_program_ids: vec![PubkeyDef(TOKEN_PROGRAM_ID)],
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(RpcError::KeyExcludedFromSecondaryIndex { .. })
+        ));
+        // No mint selections: only base Phoenix accounts and mandatory vaults.
+        assert_eq!(
+            get_phoenix_accounts(&state, GetPhoenixAccountsConfig::default())
+                .await
+                .unwrap()
+                .0
+                .account_count,
+            2
+        );
+        // The balance query must retain mint coverage without fetching a large full account payload.
+        let balance_sql = include_str!("../db/getBalance.sql")
+            .replace(
+                "$1",
+                &format!("'\\x{}'::bytea", hex::encode(key(6).to_bytes())),
+            )
+            .replace("$2", "100");
+        let row = sqlx::raw_sql(&balance_sql).fetch_one(&pool).await.unwrap();
+        assert!(state.indexer_filter.is_account_selected(
+            &key(6),
+            &TOKEN_PROGRAM_ID,
+            &row.get::<Vec<u8>, _>("data")
+        ));
+        drop(state);
+        pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&bootstrap)
+            .await
+            .unwrap();
+    }
+
     /// Run against a disposable database: CLOUDBREAK_TEST_DATABASE_URL=... cargo test ... --ignored
     #[tokio::test]
     #[ignore = "requires a disposable local PostgreSQL database"]
@@ -751,7 +1127,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        sqlx::raw_sql("CREATE TABLE slots (slot bigint, commitment int, health bool); CREATE TABLE service_health (id int, healthy bool); CREATE TABLE atomic_account_checkpoint (id int, slot bigint, transaction_count bigint, blockhash text); CREATE TABLE accounts (pubkey bytea, owner bytea, lamports bigint, slot bigint, executable bool, rent_epoch numeric, data bytea, write_version bigint DEFAULT 0); CREATE TABLE snapshot_accounts (LIKE accounts); INSERT INTO slots VALUES (100,1,true); INSERT INTO service_health VALUES (1,true); INSERT INTO atomic_account_checkpoint VALUES (1,100,3,'hash100');").execute(&mut *writer).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE slots (slot bigint, commitment int, health bool); CREATE TABLE service_health (id int, healthy bool); CREATE TABLE atomic_account_checkpoint (id int, slot bigint, transaction_count bigint, blockhash text); CREATE TABLE accounts (pubkey bytea, owner bytea, lamports bigint, slot bigint, executable bool, rent_epoch numeric, data bytea, write_version bigint DEFAULT 0, token_mint bytea GENERATED ALWAYS AS (SUBSTRING(data FROM 1 FOR 32)) STORED); CREATE TABLE snapshot_accounts (LIKE accounts); INSERT INTO slots VALUES (100,1,true); INSERT INTO service_health VALUES (1,true); INSERT INTO atomic_account_checkpoint VALUES (1,100,3,'hash100');").execute(&mut *writer).await.unwrap();
         let owner = vec![9u8; 32];
         for (key, slot, lamports) in [
             (1u8, 90i64, 1i64),
@@ -760,7 +1136,7 @@ mod tests {
             (2, 100, 0),
             (3, 101, 9),
         ] {
-            sqlx::query("INSERT INTO accounts VALUES ($1,$2,$3,$4,false,0,$5,0)")
+            sqlx::query("INSERT INTO accounts (pubkey,owner,lamports,slot,executable,rent_epoch,data,write_version) VALUES ($1,$2,$3,$4,false,0,$5,0)")
                 .bind(vec![key; 32])
                 .bind(&owner)
                 .bind(lamports)
@@ -771,7 +1147,7 @@ mod tests {
                 .unwrap();
         }
         // A vault from the snapshot table has a different owner and must be selected by key.
-        sqlx::query("INSERT INTO snapshot_accounts VALUES ($1,$2,5,90,false,0,$3,0)")
+        sqlx::query("INSERT INTO snapshot_accounts (pubkey,owner,lamports,slot,executable,rent_epoch,data,write_version) VALUES ($1,$2,5,90,false,0,$3,0)")
             .bind(vec![4u8; 32])
             .bind(vec![7u8; 32])
             .bind(vec![4u8])
@@ -808,6 +1184,8 @@ mod tests {
             .bind(vec![owner.clone(), vec![8u8; 32]])
             .bind(vec![vec![4u8; 32]])
             .bind(100i64)
+            .bind(Vec::<Vec<u8>>::new())
+            .bind(Vec::<Vec<u8>>::new())
             .fetch_all(&mut *reader)
             .await
             .unwrap();

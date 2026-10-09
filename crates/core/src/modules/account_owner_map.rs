@@ -4,9 +4,8 @@
  */
 
 //! Optional module that maintains an in-memory cache mapping accounts to their
-//! owners and the slot at which the mapping was **first** updated (by default the
-//! account is only updated when the owner changes, so the slot will be the first seen
-//! for the current owner).
+//! owners and their latest observed slot. Slot tracking prevents older gap repairs
+//! from removing a mapping still needed to mask a later closure or mint change.
 //!
 //! Main use cases:
 //! - Simplifies the closed-accounts insertion SQL by already knowing each
@@ -29,7 +28,7 @@ use tokio::time::timeout;
 pub static ACCOUNTS_OWNER_MAP: OnceLock<Arc<RwLock<HashMap<Pubkey, AccountOwnerItem>>>> =
     OnceLock::new();
 
-/// Map of accounts to their owners and the slot at which the mapping was **first** updated
+/// Map of accounts to their owners and latest observed slot
 ///
 /// Handles internally optional behavior, so it can be used even if the module is disabled
 /// and it will be a no-op.
@@ -83,23 +82,19 @@ impl AccountOwnerMap {
     ///
     /// Note: if module is disabled, this will be a no-op
     ///
-    /// It will only require a write lock if the account owner has changed or the account doesn't exist.
+    /// Older repairs cannot overwrite a newer owner or last-seen slot.
     pub fn upsert_account(&self, pubkey: &Vec<u8>, owner: &Vec<u8>, slot: u64) {
         if let Some(accounts) = &self.accounts {
             let pubkey = Pubkey::try_from(pubkey.as_slice()).unwrap();
             let owner = Pubkey::try_from(owner.as_slice()).unwrap();
 
-            // Try to read the account, if it exists check the owner
-            let existing = {
-                let guard = accounts.read().expect("Failed to read accounts");
-                guard.get(&pubkey).map(|a| (a.owner, a.slot))
-            };
-
-            if let Some((existing_owner, existing_slot)) = existing {
-                // If the owner has changed, update the account
-                // Safety check on the slot is to ensure that we don't overwrite a more recent slot with a older one
-                if existing_owner != owner && existing_slot < slot {
-                    // Add the (pubkey, owner) pair to the changed_owners map
+            // Slot/owner checks and insertion share one lock, including concurrent snapshot workers.
+            let mut map = accounts.write().expect("Failed to write accounts");
+            if let Some(item) = map.get(&pubkey) {
+                if item.slot >= slot {
+                    return;
+                }
+                if item.owner != owner {
                     self.changed_owners
                         .lock()
                         .expect("Failed to lock changed_owners")
@@ -107,21 +102,11 @@ impl AccountOwnerMap {
                         .or_default()
                         .push(ChangedOwner {
                             pubkey,
-                            owner: existing_owner,
+                            owner: item.owner,
                         });
-
-                    accounts
-                        .write()
-                        .expect("Failed to write accounts")
-                        .insert(pubkey, AccountOwnerItem { owner, slot });
                 }
-            } else {
-                // If the account doesn't exist, insert it
-                accounts
-                    .write()
-                    .expect("Failed to write accounts")
-                    .insert(pubkey, AccountOwnerItem { owner, slot });
             }
+            map.insert(pubkey, AccountOwnerItem { owner, slot });
         }
     }
 
@@ -180,7 +165,10 @@ impl AccountOwnerMap {
             for pubkey_bytes in &closed_accounts {
                 let pubkey = Pubkey::try_from(pubkey_bytes.as_slice()).unwrap();
 
-                // Only insert closed accounts that are present in the map
+                // A repair below a newer live version must retain its closure-tracking entry.
+                if map.get(&pubkey).is_some_and(|item| item.slot > slot) {
+                    continue;
+                }
                 if let Some(item) = map.remove(&pubkey) {
                     pubkeys.push(pubkey_bytes.clone());
                     owners.push(item.owner.to_bytes().to_vec());
@@ -269,30 +257,28 @@ impl AccountOwnerMap {
         owner_changed
     }
 
-    /// If the account was previously tracked but the new owner is not between the tracked ones,
-    /// then delete the account from the map(this will be done on [`Self::save_closed_accounts`]) and return
-    /// true (so it can be deleted from the database).
-    ///
-    /// Note: If the owner has changed, but it's still a tracked one, there is no need to delete the account,
-    /// only update the owner and slot (because finalize_slot will delete old versions for all owners), but
-    /// we still need to insert a mock "closed account" mask for the old owner (this is handled by the [`Self::changed_owners`] field).
+    /// Mask a previously indexed account that leaves the selection, including same-owner mint changes.
+    /// `save_closed_accounts` removes it from the map after writing the old-owner mask.
     pub fn account_to_be_deleted(
         &self,
         pubkey: &Vec<u8>,
-        owner: &Vec<u8>,
+        _owner: &Vec<u8>,
         slot: u64,
         is_new_owner_included: bool,
     ) -> bool {
         let pubkey = Pubkey::try_from(pubkey.as_slice()).unwrap();
-        let owner = Pubkey::try_from(owner.as_slice()).unwrap();
-
-        let owner_has_changed = self.check_updated_account_owner(pubkey, owner, slot);
-
-        if owner_has_changed && !is_new_owner_included {
-            return true;
+        if is_new_owner_included {
+            return false;
         }
-
-        false
+        let Some(accounts) = &self.accounts else {
+            return false;
+        };
+        // A same-owner token account can be reinitialized for an unselected mint.
+        accounts
+            .read()
+            .expect("Failed to read accounts")
+            .get(&pubkey)
+            .is_some_and(|item| item.slot < slot)
     }
 
     pub fn get_map_size(
@@ -324,5 +310,126 @@ impl AccountOwnerMap {
             }
             None => "AccountOwnerMap: not initialized".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod mint_selection_tests {
+    use super::*;
+
+    #[test]
+    fn token_mint_reinitialization_masks_same_owner_without_masking_older_repairs() {
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let map = AccountOwnerMap {
+            accounts: Some(Arc::new(RwLock::new(HashMap::from([(
+                key,
+                AccountOwnerItem { owner, slot: 100 },
+            )])))),
+            ..Default::default()
+        };
+        let key_bytes = key.to_bytes().to_vec();
+        let owner_bytes = owner.to_bytes().to_vec();
+        assert!(map.account_to_be_deleted(&key_bytes, &owner_bytes, 101, false));
+        map.upsert_account(&key_bytes, &owner_bytes, 105);
+        assert!(!map.account_to_be_deleted(&key_bytes, &owner_bytes, 103, false));
+        assert!(map.account_to_be_deleted(&key_bytes, &owner_bytes, 106, false));
+        assert!(!map.account_to_be_deleted(&key_bytes, &owner_bytes, 106, true));
+        assert!(!map.account_to_be_deleted(&key_bytes, &owner_bytes, 99, false));
+        assert!(!map.account_to_be_deleted(
+            &Pubkey::new_unique().to_bytes().to_vec(),
+            &owner_bytes,
+            101,
+            false
+        ));
+        assert!(!AccountOwnerMap::default().account_to_be_deleted(
+            &key_bytes,
+            &owner_bytes,
+            101,
+            false
+        ));
+    }
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via CLOUDBREAK_TEST_DATABASE_URL"]
+    async fn mint_reinitialization_masks_and_older_repair_preserves_future_closure_tracking() {
+        let url = std::env::var("CLOUDBREAK_TEST_DATABASE_URL").unwrap();
+        let bootstrap = sea_orm::Database::connect(&url).await.unwrap();
+        let schema = format!("mint_masks_{}", std::process::id());
+        bootstrap
+            .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
+        let mut options = sea_orm::ConnectOptions::new(url);
+        options
+            .max_connections(1)
+            .set_schema_search_path(schema.clone());
+        let db = sea_orm::Database::connect(options).await.unwrap();
+        db.execute_unprepared("CREATE TABLE accounts (pubkey bytea, owner bytea, lamports bigint, slot bigint, executable bool, rent_epoch numeric, data bytea, write_version bigint);").await.unwrap();
+        let key = Pubkey::new_unique();
+        let owner = crate::modules::token_mint_filter::TOKEN_PROGRAM_ID;
+        let key_bytes = key.to_bytes().to_vec();
+        let owner_bytes = owner.to_bytes().to_vec();
+        for slot in [100i64, 105] {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO accounts VALUES ($1,$2,1,$3,false,0,'\\x01',0)",
+                [
+                    key_bytes.clone().into(),
+                    owner_bytes.clone().into(),
+                    slot.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        let map = AccountOwnerMap {
+            db: db.clone(),
+            query_timeout: Duration::from_secs(10),
+            accounts: Some(Arc::new(RwLock::new(HashMap::new()))),
+            ..Default::default()
+        };
+        map.upsert_account(&key_bytes, &owner_bytes, 100);
+        map.upsert_account(&key_bytes, &owner_bytes, 105);
+        assert_eq!(
+            map.save_closed_accounts(vec![key_bytes.clone()], 103)
+                .await
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        assert_eq!(map.get_owner(&key), Some(owner));
+        assert!(map.account_to_be_deleted(&key_bytes, &owner_bytes, 106, false));
+        assert_eq!(
+            map.save_closed_accounts(vec![key_bytes.clone()], 106)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        assert_eq!(map.get_owner(&key), None);
+        let row = db
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT owner, lamports, data FROM accounts ORDER BY slot DESC LIMIT 1".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<Vec<u8>>("", "owner").unwrap(), owner_bytes);
+        assert_eq!(row.try_get::<i64>("", "lamports").unwrap(), 0);
+        assert!(row.try_get::<Vec<u8>>("", "data").unwrap().is_empty());
+        // A subsequent rediscovery and closure still works after the stale repair.
+        map.upsert_account(&key_bytes, &owner_bytes, 107);
+        assert_eq!(
+            map.save_closed_accounts(vec![key_bytes], 108)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        bootstrap
+            .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }

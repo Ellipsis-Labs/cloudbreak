@@ -51,7 +51,9 @@ impl SlotBlock {
                 skipped += 1;
                 continue;
             };
-            let entry = if account.lamports == 0 || !program_filter.is_account_selected(&pubkey, &owner) {
+            let entry = if account.lamports == 0
+                || !program_filter.is_account_selected(&pubkey, &owner, &account.data)
+            {
                 AccountEntry::Closed
             } else {
                 data_bytes += account.data.len();
@@ -146,6 +148,7 @@ pub(crate) mod tests {
             accounts: vec![],
             include: vec![PubkeyDef(included)],
             exclude: vec![],
+            ..Default::default()
         };
         let live_key = Pubkey::new_unique();
         let closed_key = Pubkey::new_unique();
@@ -170,6 +173,46 @@ pub(crate) mod tests {
         assert_eq!(block.accounts[&excluded_key], AccountEntry::Closed);
         assert!(block.heap_bytes > 3);
         assert_eq!(block.block_time, Some(1_700_000_010));
+    }
+
+    #[test]
+    fn mint_selected_processed_accounts_close_when_reinitialized_for_another_mint() {
+        use crate::TokenMintFilter;
+        use crate::modules::token_mint_filter::{TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID};
+        let mint = Pubkey::new_unique();
+        let key = Pubkey::new_unique();
+        let filter = AccountSelectorConfig {
+            include: vec![PubkeyDef(Pubkey::new_unique())],
+            token_mint_filters: vec![TokenMintFilter {
+                mint: PubkeyDef(mint),
+                token_program: PubkeyDef(TOKEN_PROGRAM_ID),
+            }],
+            ..Default::default()
+        };
+        let mut data = vec![0; 165];
+        data[..32].copy_from_slice(mint.as_ref());
+        data[108] = 2; // frozen accounts are included; pruning policies belong to a future endpoint
+        assert!(matches!(
+            build(
+                vec![account_info(key, TOKEN_PROGRAM_ID, 1, data.clone())],
+                &filter
+            )
+            .accounts[&key],
+            AccountEntry::Live(_)
+        ));
+        assert_eq!(
+            build(
+                vec![account_info(key, TOKEN_2022_PROGRAM_ID, 1, data.clone())],
+                &filter
+            )
+            .accounts[&key],
+            AccountEntry::Closed
+        );
+        data[..32].fill(0);
+        assert_eq!(
+            build(vec![account_info(key, TOKEN_PROGRAM_ID, 1, data)], &filter).accounts[&key],
+            AccountEntry::Closed
+        );
     }
 
     #[test]

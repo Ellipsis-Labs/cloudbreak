@@ -10,6 +10,9 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use solana_lattice_hash::lt_hash::LtHash;
 
 fn build_owner_filter(programs: &AccountSelectorConfig) -> String {
+    if !programs.accounts.is_empty() || !programs.token_mint_filters.is_empty() {
+        return String::new(); // The latest version must be chosen before data/key selection.
+    }
     let program_owners: Vec<Vec<u8>> = programs
         .include
         .iter()
@@ -105,7 +108,13 @@ pub async fn compute_db_lt_hash(
                 .context("Failed to read executable")?;
             let data: Vec<u8> = row.try_get_by_index(4).context("Failed to read data")?;
 
-            if lamports <= 0 {
+            if lamports <= 0
+                || !programs.is_account_selected(
+                    &solana_pubkey::Pubkey::try_from(pubkey.as_slice())?,
+                    &solana_pubkey::Pubkey::try_from(owner.as_slice())?,
+                    &data,
+                )
+            {
                 continue;
             }
 

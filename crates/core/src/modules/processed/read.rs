@@ -107,6 +107,7 @@ mod tests {
             accounts: vec![],
             include: vec![PubkeyDef(selected)],
             exclude: vec![],
+            ..Default::default()
         };
         chain.block_owned(101, 100, vec![(closed, selected, 5), (moved, selected, 5)]);
         chain.block_owned(102, 101, vec![(closed, selected, 0), (moved, other, 6)]);

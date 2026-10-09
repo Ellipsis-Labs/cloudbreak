@@ -24,6 +24,7 @@ mod m20260711_000000_create_index_patterns_table;
 mod m20260717_000000_create_supply_tables;
 mod m20260808_000000_largest_accounts_record;
 mod m20261009_000000_atomic_account_checkpoints;
+mod m20261009_000001_token_mint_filters;
 
 pub struct Migrator;
 
@@ -48,6 +49,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260717_000000_create_supply_tables::Migration),
             Box::new(m20260808_000000_largest_accounts_record::Migration),
             Box::new(m20261009_000000_atomic_account_checkpoints::Migration),
+            Box::new(m20261009_000001_token_mint_filters::Migration),
         ]
     }
 }
@@ -249,6 +251,28 @@ mod compatibility_tests {
                 .len(),
             1
         );
+        let mint_filter = cloudbreak_core::TokenMintFilter {
+            mint: PubkeyDef(Pubkey::new_from_array([3; 32])),
+            token_program: PubkeyDef(cloudbreak_core::modules::token_mint_filter::TOKEN_PROGRAM_ID),
+        };
+        let mint_selected = AccountSelectorConfig {
+            token_mint_filters: vec![mint_filter.clone()],
+            ..exact.clone()
+        };
+        assert!(
+            EnvironmentInfo::upsert_filters(&db, &mint_selected)
+                .await
+                .is_err()
+        );
+        let mint_migration = m20261009_000001_token_mint_filters::Migration;
+        mint_migration.up(&manager).await.unwrap();
+        EnvironmentInfo::upsert_filters(&db, &mint_selected)
+            .await
+            .unwrap();
+        let loaded = EnvironmentInfo::load_filters(&db).await.unwrap();
+        assert_eq!(loaded.token_mint_filters, vec![mint_filter]);
+        assert_eq!(loaded.accounts, exact.accounts);
+        assert!(mint_migration.down(&manager).await.is_err());
         assert!(migration.down(&manager).await.is_err()); // never discard active filter metadata
         EnvironmentInfo::upsert_filters(&db, &legacy).await.unwrap();
         assert!(
@@ -273,6 +297,7 @@ mod compatibility_tests {
             .unwrap()
             .is_some()
         );
+        mint_migration.down(&manager).await.unwrap();
         migration.down(&manager).await.unwrap();
         EnvironmentInfo::upsert_filters(&db, &legacy).await.unwrap();
         let filters = EnvironmentInfo::load_filters(&db).await.unwrap();

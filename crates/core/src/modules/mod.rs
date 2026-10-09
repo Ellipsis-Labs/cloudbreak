@@ -13,3 +13,4 @@ pub mod query_tracker_api;
 pub mod rpc_filter_type;
 pub mod service_health;
 pub mod supply;
+pub mod token_mint_filter;

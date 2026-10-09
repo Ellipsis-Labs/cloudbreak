@@ -50,7 +50,9 @@ pub async fn get_multiple_accounts(
     if let Some(min_context_slot) = config.min_context_slot
         && latest_slot < min_context_slot
     {
-        return Err(RpcError::MinContextSlotNotReached { context_slot: latest_slot });
+        return Err(RpcError::MinContextSlotNotReached {
+            context_slot: latest_slot,
+        });
     }
 
     // Short-circuit for an empty input list, return `value: []` without touching the DB.
@@ -98,7 +100,10 @@ pub async fn get_multiple_accounts(
         let owner = account.owner;
 
         // Per-position indexer-filter check: if the owner is excluded, we return None at that position and log a tracing error.
-        if !state.indexer_filter.is_account_selected(&pubkey, &owner) {
+        if !state
+            .indexer_filter
+            .is_account_selected(&pubkey, &owner, &account.data)
+        {
             tracing::error!(
                 target: "gma_indexer_filter",
                 pubkey = %pubkey,

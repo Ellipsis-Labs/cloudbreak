@@ -1652,6 +1652,7 @@ dependencies = [
  "solana-pubkey 4.3.0",
  "solana-rpc-client-api",
  "solana-stake-interface",
+ "spl-token-2022-interface",
  "thiserror 2.0.20",
  "tokio",
  "toml",

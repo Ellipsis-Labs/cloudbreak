@@ -4,10 +4,11 @@
  */
 
 // use crate::AccountSelect;
+pub use crate::modules::token_mint_filter::TokenMintFilter;
 use anyhow::Result;
 use sea_orm::{ConnectOptions, ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use solana_pubkey::Pubkey;
 use std::borrow::Cow;
 use std::fs;
@@ -114,8 +115,14 @@ impl GrpcConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PubkeyDef(pub Pubkey);
+
+impl Serialize for PubkeyDef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
 
 impl<'de> Deserialize<'de> for PubkeyDef {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -131,6 +138,9 @@ impl<'de> Deserialize<'de> for PubkeyDef {
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct AccountSelectorConfig {
+    /// Additional token holders selected by (token program, mint).
+    #[serde(rename = "token-mint-filters", default)]
+    pub token_mint_filters: Vec<TokenMintFilter>,
     /// Exact accounts included regardless of their program owner (e.g. token vaults).
     #[serde(rename = "accounts", default)]
     pub accounts: Vec<PubkeyDef>,
@@ -141,8 +151,30 @@ pub struct AccountSelectorConfig {
 }
 
 impl AccountSelectorConfig {
-    pub fn is_account_selected(&self, pubkey: &Pubkey, owner: &Pubkey) -> bool {
-        self.accounts.iter().any(|key| key.0 == *pubkey) || self.is_program_selected(owner)
+    pub fn is_account_selected(&self, pubkey: &Pubkey, owner: &Pubkey, data: &[u8]) -> bool {
+        self.accounts.iter().any(|key| key.0 == *pubkey)
+            || self.is_program_selected(owner)
+            || self.is_token_mint_selected(owner, data)
+    }
+
+    pub fn is_token_mint_selected(&self, owner: &Pubkey, data: &[u8]) -> bool {
+        crate::modules::token_mint_filter::matches_token_mint_filters(
+            &self.token_mint_filters,
+            owner,
+            data,
+        )
+    }
+
+    pub fn covers_token_mint(&self, filter: &TokenMintFilter) -> bool {
+        self.is_program_selected(&filter.token_program.0)
+            || self.token_mint_filters.contains(filter)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for filter in &self.token_mint_filters {
+            filter.validate()?;
+        }
+        Ok(())
     }
 
     pub fn is_program_selected(&self, program: &Pubkey) -> bool {
@@ -176,6 +208,7 @@ impl EnvironmentInfo {
         db: &DatabaseConnection,
         filters: &AccountSelectorConfig,
     ) -> Result<()> {
+        filters.validate()?;
         let (mode, programs) = if filters.include.is_empty() {
             ("exclude", &filters.exclude)
         } else {
@@ -191,29 +224,47 @@ impl EnvironmentInfo {
             DatabaseBackend::Postgres,
             "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('environment_info') AND attname = 'accounts' AND NOT attisdropped) AS has_accounts".to_string(),
         )).await?.ok_or_else(|| anyhow::anyhow!("Missing schema metadata"))?.try_get::<bool>("", "has_accounts")?;
+        let has_mints = db.query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('environment_info') AND attname = 'token_mint_filters' AND NOT attisdropped) AS has_mints".to_string(),
+        )).await?.ok_or_else(|| anyhow::anyhow!("Missing schema metadata"))?.try_get::<bool>("", "has_mints")?;
+        anyhow::ensure!(
+            has_mints || filters.token_mint_filters.is_empty(),
+            "Mint-filter indexing requires the token-mint-filters migration"
+        );
+        let accounts_csv = filters
+            .accounts
+            .iter()
+            .map(|p| p.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut columns = "id, mode, programs".to_string();
+        let mut parameters = "1, $1, $2".to_string();
+        let mut updates = "mode = EXCLUDED.mode, programs = EXCLUDED.programs".to_string();
+        let mut values = vec![mode.into(), programs_csv.into()];
         if has_accounts {
-            let accounts_csv = filters
-                .accounts
-                .iter()
-                .map(|p| p.0.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            db.execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "INSERT INTO environment_info (id, mode, programs, accounts) VALUES (1, $1, $2, $3) ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs, accounts = EXCLUDED.accounts",
-                [mode.into(), programs_csv.into(), accounts_csv.into()],
-            )).await?;
+            columns.push_str(", accounts");
+            parameters.push_str(", $3");
+            updates.push_str(", accounts = EXCLUDED.accounts");
+            values.push(accounts_csv.into());
         } else {
             anyhow::ensure!(
                 filters.accounts.is_empty(),
                 "Exact-account indexing requires the atomic-account-checkpoints migration"
             );
-            db.execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "INSERT INTO environment_info (id, mode, programs) VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs",
-                [mode.into(), programs_csv.into()],
-            )).await?;
         }
+        if has_mints {
+            anyhow::ensure!(
+                has_accounts,
+                "Mint-filter schema requires exact-account metadata"
+            );
+            columns.push_str(", token_mint_filters");
+            parameters.push_str(", $4::jsonb");
+            updates.push_str(", token_mint_filters = EXCLUDED.token_mint_filters");
+            values.push(serde_json::to_string(&filters.token_mint_filters)?.into());
+        }
+        db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            format!("INSERT INTO environment_info ({columns}) VALUES ({parameters}) ON CONFLICT (id) DO UPDATE SET {updates}"), values)).await?;
 
         Ok(())
     }
@@ -222,7 +273,7 @@ impl EnvironmentInfo {
         let row = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "SELECT mode, programs, COALESCE(to_jsonb(environment_info)->>'accounts', '') AS accounts FROM environment_info WHERE id = 1".to_string(),
+                "SELECT mode, programs, COALESCE(to_jsonb(environment_info)->>'accounts', '') AS accounts, COALESCE(to_jsonb(environment_info)->>'token_mint_filters', '[]') AS token_mint_filters FROM environment_info WHERE id = 1".to_string(),
             ))
             .await?
             .ok_or_else(|| {
@@ -245,13 +296,20 @@ impl EnvironmentInfo {
             .map(|s| Pubkey::from_str(s).map(PubkeyDef))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let token_mint_filters: Vec<TokenMintFilter> =
+            serde_json::from_str(&row.try_get::<String>("", "token_mint_filters")?)?;
+        for filter in &token_mint_filters {
+            filter.validate()?;
+        }
         Ok(match mode.as_str() {
             "include" => AccountSelectorConfig {
+                token_mint_filters,
                 accounts,
                 include: programs,
                 exclude: Vec::new(),
             },
             "exclude" => AccountSelectorConfig {
+                token_mint_filters,
                 accounts,
                 include: Vec::new(),
                 exclude: programs,
@@ -1736,10 +1794,49 @@ mod tests {
             accounts: vec![PubkeyDef(key)],
             include: vec![PubkeyDef(Pubkey::new_from_array([3; 32]))],
             exclude: vec![],
+            ..Default::default()
         };
-        assert!(filters.is_account_selected(&key, &owner));
+        assert!(filters.is_account_selected(&key, &owner, &[]));
         assert!(!filters.is_program_selected(&owner));
-        assert!(!filters.is_account_selected(&Pubkey::new_from_array([4; 32]), &owner));
+        assert!(!filters.is_account_selected(&Pubkey::new_from_array([4; 32]), &owner, &[]));
+    }
+
+    #[test]
+    fn token_mint_filters_are_additive_and_do_not_claim_full_program_coverage() {
+        use crate::modules::token_mint_filter::TOKEN_PROGRAM_ID;
+        let mint = Pubkey::new_unique();
+        let key = Pubkey::new_unique();
+        let phoenix = Pubkey::new_unique();
+        let filter = TokenMintFilter {
+            mint: PubkeyDef(mint),
+            token_program: PubkeyDef(TOKEN_PROGRAM_ID),
+        };
+        let selectors = AccountSelectorConfig {
+            include: vec![PubkeyDef(phoenix)],
+            token_mint_filters: vec![filter.clone()],
+            ..Default::default()
+        };
+        let mut data = vec![0; 165];
+        data[..32].copy_from_slice(mint.as_ref());
+        data[108] = 1;
+        assert!(selectors.is_account_selected(&key, &TOKEN_PROGRAM_ID, &data));
+        assert!(selectors.is_account_selected(&key, &phoenix, &[]));
+        assert!(selectors.covers_token_mint(&filter));
+        assert!(!selectors.is_program_selected(&TOKEN_PROGRAM_ID));
+        data[..32].fill(0); // same-owner reinitialization leaves the selected mint
+        assert!(!selectors.is_account_selected(&key, &TOKEN_PROGRAM_ID, &data));
+        let exact = AccountSelectorConfig {
+            accounts: vec![PubkeyDef(key)],
+            ..selectors
+        };
+        assert!(exact.is_account_selected(&key, &TOKEN_PROGRAM_ID, &data));
+        let full = AccountSelectorConfig::default();
+        assert!(full.covers_token_mint(&filter));
+        let config: AccountSelectorConfig = toml::from_str(&format!(
+            "include = ['{phoenix}']\n[[token-mint-filters]]\nmint = '{mint}'"
+        ))
+        .unwrap();
+        assert_eq!(config.token_mint_filters, vec![filter]);
     }
 
     #[test]
@@ -1851,6 +1948,9 @@ url = "postgres://localhost/cloudbreak"
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PhoenixAccountsConfig {
+    /// Default additional token-holder selections, constrained to indexer coverage.
+    #[serde(default)]
+    pub token_mint_filters: Vec<TokenMintFilter>,
     #[serde(default)]
     pub enabled: bool,
     /// Phoenix and Ember program IDs; every account owned by these is returned.
