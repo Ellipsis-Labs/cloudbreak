@@ -113,3 +113,30 @@ The migration is additive. Legacy SQL readers/writers can access the migrated sc
 For rollback, stop serving the new endpoint and stop checkpoint publication. Remove exact-account and token-mint filters, restart the indexer so its published filter metadata is cleared, and only then roll back the migration if needed. The down migrations refuse to remove active exact-account or token-mint metadata. Existing account rows are retained. Baseline API/indexer operation supports the rolled-back schema; remove Phoenix-specific configuration before running older binaries.
 
 The generic account-write/slot-publication failure guards remain active even when the endpoint is disabled: failing to persist a complete slot marks the node unhealthy and stops publication/cleanup. This intentional safety behavior is separate from the opt-in checkpoint extension.
+
+## Maintaining the upstream fork
+
+The upstream repository is `https://github.com/solana-rpc/cloudbreak.git`; the deployment fork is `Ellipsis-Labs/cloudbreak`. Keep them as separate `upstream` and `origin` remotes. Merge upstream updates into a clean feature/integration checkout and validate them before pushing. Preserve published commit history; upstream synchronization does not require rebasing or force-pushing this PR.
+
+Most extension code lives in dedicated files: `api/src/methods/phoenix_accounts.rs`, `core/src/modules/account_snapshot.rs`, `core/src/modules/token_mint_filter.rs`, and `index/src/modules/account_checkpoint.rs`. The existing RPC dispatcher has one additional method arm. Config additions default to disabled/empty, migrations are additive, and legacy metadata schemas remain supported when their extensions are disabled. There are no Phoenix SDK or program-crate dependencies.
+
+Shared code still needs care during upstream merges:
+
+- Keep `is_program_selected` as a full-owner coverage check. Data-aware exact-key/mint selection uses `is_account_selected`; partial mint coverage must not enable program-wide RPCs.
+- Keep checkpoint SQL in its extension module. Both publishers use `db_queries::slot_statement`, so upstream slot-upsert changes have one SQL implementation to update.
+- Preserve the account-write failure checks before publication and cleanup, plus the owner map's latest-slot guards. These prevent incomplete snapshots and stale balances after closure, reinitialization or an older repair.
+- Merge migration registration lists while retaining already published migration names and their rollback guards. Do not rewrite applied migrations to resolve an upstream conflict.
+
+For this PR, run these commands from its clean checkout, resolving any merge conflicts before validation:
+
+```sh
+git fetch origin
+git fetch upstream main
+git merge --no-edit origin/main
+git merge --no-edit upstream/main
+cargo +1.98.1 check --tests -p cloudbreak
+cargo +1.98.1 test --lib -p cloudbreak-core -p cloudbreak-api -p cloudbreak-index -p cloudbreak-migration
+git push origin HEAD:gally/feat/atomic-phoenix-accounts
+```
+
+Also run the ignored PostgreSQL tests against a disposable local database by setting `CLOUDBREAK_TEST_DATABASE_URL` and adding `-- --include-ignored` to the test command. They cover checkpoint publication failure, legacy-schema upgrade/rollback, atomic reads, mint changes and closure tracking. A conflict-free Git merge alone does not verify those behaviors. The fork's current upstream base can be checked with `git merge-base HEAD upstream/main`; feature changes are reviewed with `git diff origin/main...HEAD`.
