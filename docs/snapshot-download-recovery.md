@@ -40,20 +40,89 @@ Retry and progress logs include byte counts and snapshot type. Signed URLs are
 omitted from request errors. Existing download-size/progress message formats are
 retained for dashboard parsing.
 
+## Completed archive cache and PVC cleanup
+
+Set `CLOUDBREAK_SNAPSHOT_CACHE=true` **in addition to recovery** to reuse completed
+downloads across restarts. Cache defaults off so older retry-only images and their
+startup scripts can be rolled back safely. Invalid values or cache without
+recovery are configuration errors. A completed archive is
+synced and atomically renamed before a completion marker is published. Parent
+directories are synced after creation and after each rename so the archive is
+durable before its completion marker. The marker
+records filename, slot, source URL without credentials/query/fragment, byte length
+and strong ETag. Files without a marker (including downloads from older images),
+partial files, malformed markers and size mismatches are never reused.
+
+Reuse probes the selected remote object with `GET`, `Range: bytes=0-0` and
+`If-Match`. The ETag and total length must still match. This works with URLs signed
+for GET, whose signatures may reject HEAD. Changing signed query parameters does
+not invalidate the resource identity. Network errors, HTTP 429/5xx, and expired
+URLs trigger bounded validation retries and signed-URL refresh while retaining
+the completed archive. If validation remains uncertain, startup fails with the
+archive intact for the next attempt. Confirmed identity/size mismatches or missing
+validators cause a fresh download. No cross-process partial-download resume is added.
+
+The cache wrapper invalidates an archive and its marker on unpacking/metadata
+validation errors, allowing the next startup to fetch it again. Storage errors
+such as permission failures, full disks and device errors preserve the archive;
+fixing the storage problem need not repeat the download. Later database errors
+never evict downloaded archives. The indexer's existing global panic hook exits
+on failed bootstrap; global panic behavior and indexing logic are unchanged.
+
+After the tracker selects a startup pair covering the new received slot, the
+indexer retains only that pair's named archives and markers. Obsolete numeric
+`snapshot_<slot>` and timestamped snapshot directories are deleted, along with
+partial files, obsolete filenames and extraction directories in retained slots.
+Cleanup happens before the full/incremental tasks start and does not follow
+symlinks. A new incremental can reuse its unchanged full base; a different full
+base removes the old cache. Run one indexer per snapshot directory/PVC.
+
+## Pre-populating the PVC
+
+A separate tool can download/upload archives before an indexer rollout without
+changing Cloudbreak. Place the archive under `/data/snapshot_<slot>/<filename>`
+and publish one sibling `<filename>.complete.json` only after the upload completes:
+
+```json
+{
+  "filename": "snapshot-123-example.tar.zst",
+  "slot": 123,
+  "source": "https://provider.example/mainnet-beta/snapshot-123-example.tar.zst",
+  "etag": "\"the-provider-strong-etag\"",
+  "bytes": 123456789
+}
+```
+
+Use the ETag and full Content-Length observed while downloading that exact object,
+not values guessed from a pre-existing local file. `source` is the selected download
+URL with query, fragment and user credentials removed. Upload to a temporary name,
+then atomically rename the complete archive and finally its marker. The ETag is an
+opaque object validator; multipart ETags are not local-file MD5 checksums.
+
+The marker is a trusted assertion from the downloader that it finished transferring
+the object. Cloudbreak checks local length and remote identity; it does not hash
+all archive bytes on restart. A bare archive is intentionally not reused. If an
+upload tool cannot publish this record, Cloudbreak downloads once to establish it.
+The tracker must still select the matching full base in a pair covering the new
+startup slot; uploading an old full/incremental pair does not force its selection.
+Unpacking, ingestion and database startup cleanup still run after cache reuse.
+
 ## Deployment boundary
 
-This recovers downloads **inside a running process**, not across pod/container
-restarts. The current infrastructure startup script deletes snapshot directories
-and runs `cloudbreak-migration fresh` on every start. This PR does not change
-those database rebuild or restart policies, disable health checks, or enable
-recovery in production.
+The startup script must preserve `/data/snapshot_*` only when both recovery and
+cache are enabled.
+Enable `CLOUDBREAK_SNAPSHOT_CACHE=true` together with an image containing this
+cache implementation;
+the old recovery implementation has no startup cache pruning. Keep the original
+snapshot deletion when either flag is disabled. Tracker-response files can still be
+removed on every start.
 
-A rollout therefore still rebuilds the index. Allow it to bootstrap before
-routing traffic, or validate on an inactive independent stack. After enabling,
-a transient download failure should log a retry and retain the byte offset;
-container restart counts should remain unchanged. The service remains unhealthy
-until snapshot processing and cleanup finish. Exhausted retries still propagate
-to the existing restart path.
+Database rebuild policy is unchanged: `cloudbreak-migration fresh`, archive
+unpacking, account ingestion, indexes and startup cleanup still run. Cache reuse
+saves download time, not total bootstrap time. The service remains unhealthy
+until processing and cleanup complete. A rollout therefore still rebuilds the
+index; validate on an inactive independent stack or allow bootstrap before routing
+traffic. No live deployment is required to validate the cache with local fixtures.
 
 ## Checks
 
@@ -61,3 +130,11 @@ to the existing restart path.
 truncated bodies, validated range resumption, ignored ranges, missing validators,
 changed ETags, wrong offsets, expiring URLs, snapshot identity and retry limits.
 These fixtures do not verify an external provider's live range behavior.
+
+Cache fixtures also cover restart reuse with renewed signed queries, remote ETag
+changes, truncated/unmarked archives, corrupt markers, changed sources, failed
+probes, selected-pair PVC pruning and symlink-safe cleanup.
+
+Review regression fixtures cover transient/expired cache probes without refetching,
+exhausted validation preserving archives, corrupt archive eviction/refetch, storage
+failures preserving archives, and the cache-disabled transport recovery path.

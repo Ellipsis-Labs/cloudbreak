@@ -8,14 +8,81 @@ use tokio::{fs::File, io::AsyncWriteExt, time::Instant};
 
 use crate::sidecar::SnapshotData;
 
+mod cache;
+
+pub(crate) async fn prepare_cache(pair: &crate::sidecar::SnapshotPair) -> anyhow::Result<()> {
+    cache::prepare(Path::new("."), pair).await
+}
+
+/// Keep corrupt-cache recovery at the archive boundary, before any database writes.
+pub(crate) async fn unpack(
+    snapshot: &SnapshotData,
+    directory: &Path,
+) -> anyhow::Result<crate::sidecar::UnpackedSnapshot> {
+    let result = crate::sidecar::unpack_compressed_snapshot(
+        directory.join(&snapshot.file_name),
+        directory,
+        snapshot.slot,
+    );
+    if let Err(error) = &result {
+        invalidate_bad_archive(snapshot, directory, error).await?;
+    }
+    result
+}
+
+async fn invalidate_bad_archive(
+    snapshot: &SnapshotData,
+    directory: &Path,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    // Disk-full/permission/device failures do not prove that a valid archive is corrupt.
+    let storage_failure = error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::StorageFull
+            ) || (io.raw_os_error().is_some() && io.kind() != std::io::ErrorKind::NotFound)
+        })
+    });
+    if !storage_failure {
+        tracing::warn!(target: "snapshot_cache", "Invalidating snapshot {} after archive validation failed", snapshot.file_name);
+        cache::invalidate(snapshot, directory).await?;
+        cache::remove(&directory.join("uncompressed_snapshot")).await?;
+        cache::sync_directory(directory).await?;
+    }
+    Ok(())
+}
+
 const MAX_RETRIES: u32 = 5;
 
 pub(crate) fn enabled(value: Option<&str>) -> anyhow::Result<bool> {
+    flag_enabled(value, "CLOUDBREAK_SNAPSHOT_DOWNLOAD_RECOVERY")
+}
+
+fn flag_enabled(value: Option<&str>, name: &str) -> anyhow::Result<bool> {
     match value {
         None | Some("false") | Some("0") => Ok(false),
         Some("true") | Some("1") => Ok(true),
-        _ => bail!("CLOUDBREAK_SNAPSHOT_DOWNLOAD_RECOVERY must be true, false, 1 or 0"),
+        _ => bail!("{name} must be true, false, 1 or 0"),
     }
+}
+
+pub(crate) fn cache_enabled() -> anyhow::Result<bool> {
+    cache_requested(
+        std::env::var("CLOUDBREAK_SNAPSHOT_CACHE").ok().as_deref(),
+        std::env::var("CLOUDBREAK_SNAPSHOT_DOWNLOAD_RECOVERY")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn cache_requested(cache: Option<&str>, recovery: Option<&str>) -> anyhow::Result<bool> {
+    let cache = flag_enabled(cache, "CLOUDBREAK_SNAPSHOT_CACHE")?;
+    ensure!(
+        !cache || enabled(recovery)?,
+        "CLOUDBREAK_SNAPSHOT_CACHE requires CLOUDBREAK_SNAPSHOT_DOWNLOAD_RECOVERY"
+    );
+    Ok(cache)
 }
 
 #[derive(Default)]
@@ -52,6 +119,7 @@ pub(crate) async fn download(
         snapshot,
         directory,
         Duration::from_secs(1),
+        cache_enabled()?,
     )
     .await
 }
@@ -63,17 +131,33 @@ async fn download_with_client(
     snapshot: &SnapshotData,
     directory: &Path,
     retry_delay: Duration,
+    use_cache: bool,
 ) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(directory).await?;
     let destination = directory.join(&snapshot.file_name);
     let partial = directory.join(format!("{}.part", snapshot.file_name));
-    // Only resume bytes written in this invocation, with the corresponding in-memory ETag.
-    let mut file = File::create(&partial).await?;
-    let mut transfer = Transfer::default();
     let mut url = snapshot
         .download_url
         .clone()
         .unwrap_or_else(|| format!("{endpoint}/v1/snapshot/{}", snapshot.file_name));
+    if use_cache {
+        cache::sync_directory(
+            directory
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+        .await?;
+        if reuse_with_retries(client, tracker, snapshot, directory, &mut url, retry_delay).await? {
+            tracing::info!(target: "snapshot_cache", "Reusing completed snapshot {}", snapshot.file_name);
+            return Ok(());
+        }
+    }
+    // Never leave an old completion record describing a replacement archive.
+    cache::invalidate(snapshot, directory).await?;
+    // Only resume bytes written in this invocation, with the corresponding in-memory ETag.
+    let mut file = File::create(&partial).await?;
+    let mut transfer = Transfer::default();
     let started = Instant::now();
     let mut refresh = false;
     for attempt in 0..=MAX_RETRIES {
@@ -99,6 +183,17 @@ async fn download_with_client(
                 file.sync_all().await?;
                 drop(file);
                 tokio::fs::rename(&partial, &destination).await?;
+                if use_cache {
+                    cache::sync_directory(directory).await?;
+                    cache::publish(
+                        &url,
+                        snapshot,
+                        directory,
+                        transfer.downloaded,
+                        transfer.etag.as_deref(),
+                    )
+                    .await?;
+                }
                 tracing::info!(target: "download_snapshot_file", downloaded_bytes = transfer.downloaded,
                     "File {} downloaded successfully in {} secs ({:?})",
                     snapshot.file_name, started.elapsed().as_secs_f64(), snapshot.snapshot_type);
@@ -113,6 +208,42 @@ async fn download_with_client(
         transfer.downloaded,
         snapshot.snapshot_type
     )
+}
+
+async fn reuse_with_retries(
+    client: &Client,
+    tracker: &str,
+    snapshot: &SnapshotData,
+    directory: &Path,
+    url: &mut String,
+    retry_delay: Duration,
+) -> anyhow::Result<bool> {
+    let mut refresh = false;
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(retry_delay * (1 << (attempt - 1))).await;
+        }
+        if refresh {
+            match refresh_url(client, tracker, snapshot).await {
+                Ok(fresh) => {
+                    *url = fresh;
+                    refresh = false;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "snapshot_cache", "Could not refresh cache validation URL: {error:#}");
+                    continue;
+                }
+            }
+        }
+        match cache::reuse(client, url, snapshot, directory).await? {
+            cache::Probe::Hit => return Ok(true),
+            cache::Probe::Miss => return Ok(false),
+            cache::Probe::RefreshUrl => refresh = true,
+            cache::Probe::Retry => (),
+        }
+        tracing::warn!(target: "snapshot_cache", attempt, "Retrying snapshot cache validation; retaining completed archive");
+    }
+    bail!("Snapshot cache validation exhausted retries; completed archive retained")
 }
 
 async fn receive(
@@ -335,6 +466,7 @@ mod tests {
             &snapshot(&url),
             dir.path(),
             Duration::ZERO,
+            true,
         )
         .await;
         let requests = tokio::time::timeout(Duration::from_secs(3), task)
@@ -342,6 +474,510 @@ mod tests {
             .unwrap()
             .unwrap();
         (result, requests, dir)
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_completed_archive_with_fresh_signed_query() {
+        let (url, task) = server(vec![
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+            response(
+                "206 Partial Content",
+                "Content-Length: 1\r\nContent-Range: bytes 0-0/8\r\nETag: \"same\"\r\n",
+                "a",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        for query in ["?signature=old", "?signature=new"] {
+            download_with_client(
+                &client,
+                &url,
+                &url,
+                &snapshot(&format!("{url}{query}")),
+                dir.path(),
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with("get "));
+        assert!(requests[1].contains("range: bytes=0-0"));
+        assert!(requests[1].contains("if-match: \"same\""));
+        assert_eq!(
+            std::fs::read(dir.path().join("snapshot-1-test.tar.zst")).unwrap(),
+            b"abcdefgh"
+        );
+        let marker =
+            std::fs::read_to_string(dir.path().join("snapshot-1-test.tar.zst.complete.json"))
+                .unwrap();
+        assert!(!marker.contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn changed_etag_redownloads_completed_archive() {
+        let (url, task) = server(vec![
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"old\"\r\n",
+                "abcdefgh",
+            ),
+            response("200 OK", "Content-Length: 8\r\nETag: \"new\"\r\n", ""),
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"new\"\r\n",
+                "ijklmnop",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        for _ in 0..2 {
+            download_with_client(
+                &client,
+                &url,
+                &url,
+                &snapshot(&url),
+                dir.path(),
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(task.await.unwrap().len(), 3);
+        assert_eq!(
+            std::fs::read(dir.path().join("snapshot-1-test.tar.zst")).unwrap(),
+            b"ijklmnop"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmarked_or_truncated_archives_are_not_reused() {
+        let (url, task) = server(vec![
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot-1-test.tar.zst");
+        std::fs::write(&path, b"partial").unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&url),
+            dir.path(),
+            Duration::ZERO,
+            true,
+        )
+        .await
+        .unwrap();
+        std::fs::write(&path, b"abc").unwrap();
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&url),
+            dir.path(),
+            Duration::ZERO,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(task.await.unwrap().iter().all(|r| r.starts_with("get ")));
+        assert_eq!(std::fs::read(path).unwrap(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn missing_validator_or_mismatched_probe_falls_back_to_download() {
+        for probe in [
+            response("200 OK", "Content-Length: 8\r\n", ""),
+            response(
+                "206 Partial Content",
+                "Content-Length: 1\r\nContent-Range: bytes 0-0/9\r\nETag: \"same\"\r\n",
+                "a",
+            ),
+        ] {
+            let (url, task) = server(vec![
+                response(
+                    "200 OK",
+                    "Content-Length: 8\r\nETag: \"same\"\r\n",
+                    "abcdefgh",
+                ),
+                probe,
+                response(
+                    "200 OK",
+                    "Content-Length: 8\r\nETag: \"same\"\r\n",
+                    "abcdefgh",
+                ),
+            ])
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let client = Client::builder().no_proxy().build().unwrap();
+            for _ in 0..2 {
+                download_with_client(
+                    &client,
+                    &url,
+                    &url,
+                    &snapshot(&url),
+                    dir.path(),
+                    Duration::ZERO,
+                    true,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(task.await.unwrap().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn different_source_and_corrupt_markers_are_cache_misses() {
+        let (url, task) = server(vec![
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        for path in ["/old", "/new"] {
+            download_with_client(
+                &client,
+                &url,
+                &url,
+                &snapshot(&format!("{url}{path}")),
+                dir.path(),
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join("snapshot-1-test.tar.zst.complete.json"),
+            b"invalid",
+        )
+        .unwrap();
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&format!("{url}/new")),
+            dir.path(),
+            Duration::ZERO,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(task.await.unwrap().iter().all(|r| !r.contains("range:")));
+    }
+
+    #[tokio::test]
+    async fn transient_cache_probes_retry_without_refetching() {
+        let (url, task) = server(vec![
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+            response("503 Service Unavailable", "Content-Length: 0\r\n", ""),
+            response("429 Too Many Requests", "Content-Length: 0\r\n", ""),
+            "broken response".into(),
+            response(
+                "206 Partial Content",
+                "Content-Length: 1\r\nContent-Range: bytes 0-0/8\r\nETag: \"same\"\r\n",
+                "a",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        for _ in 0..2 {
+            download_with_client(
+                &client,
+                &url,
+                &url,
+                &snapshot(&url),
+                dir.path(),
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let requests = task.await.unwrap();
+        assert!(requests[1..].iter().all(|r| r.contains("range: bytes=0-0")));
+        assert_eq!(
+            std::fs::read(dir.path().join("snapshot-1-test.tar.zst")).unwrap(),
+            b"abcdefgh"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_cache_probes_preserve_completed_archive() {
+        let mut replies = vec![response(
+            "200 OK",
+            "Content-Length: 8\r\nETag: \"same\"\r\n",
+            "abcdefgh",
+        )];
+        replies.extend(
+            (0..=MAX_RETRIES)
+                .map(|_| response("503 Service Unavailable", "Content-Length: 0\r\n", "")),
+        );
+        let (url, task) = server(replies).await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&url),
+            dir.path(),
+            Duration::ZERO,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            download_with_client(
+                &client,
+                &url,
+                &url,
+                &snapshot(&url),
+                dir.path(),
+                Duration::ZERO,
+                true
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(task.await.unwrap().len(), (MAX_RETRIES + 2) as usize);
+        assert_eq!(
+            std::fs::read(dir.path().join("snapshot-1-test.tar.zst")).unwrap(),
+            b"abcdefgh"
+        );
+        assert!(
+            dir.path()
+                .join("snapshot-1-test.tar.zst.complete.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_cache_url_refreshes_validation_without_refetching() {
+        let (url, task) = server(vec![
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+            response("403 Forbidden", "Content-Length: 0\r\n", ""),
+            response(
+                "206 Partial Content",
+                "Content-Length: 1\r\nContent-Range: bytes 0-0/8\r\nETag: \"same\"\r\n",
+                "a",
+            ),
+        ])
+        .await;
+        let body = serde_json::json!([{"files":[{"file_name":"snapshot-1-test.tar.zst","download_url":format!("{url}?signature=fresh")}]}]).to_string();
+        let (tracker_url, tracker) = server(vec![response(
+            "200 OK",
+            &format!("Content-Length: {}\r\n", body.len()),
+            &body,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        for _ in 0..2 {
+            download_with_client(
+                &client,
+                &url,
+                &tracker_url,
+                &snapshot(&url),
+                dir.path(),
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let requests = task.await.unwrap();
+        assert!(requests[2].contains("signature=fresh"));
+        assert!(requests[2].contains("range: bytes=0-0"));
+        assert_eq!(tracker.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_archive_is_evicted_then_refetched() {
+        let (url, task) = server(vec![
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+            response(
+                "200 OK",
+                "Content-Length: 8\r\nETag: \"same\"\r\n",
+                "abcdefgh",
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&url),
+            dir.path(),
+            Duration::ZERO,
+            true,
+        )
+        .await
+        .unwrap();
+        let archive = dir.path().join("snapshot-1-test.tar.zst");
+        std::fs::write(&archive, b"badbytes").unwrap();
+        assert!(unpack(&snapshot(&url), dir.path()).await.is_err());
+        assert!(!archive.exists());
+        assert!(
+            !dir.path()
+                .join("snapshot-1-test.tar.zst.complete.json")
+                .exists()
+        );
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&url),
+            dir.path(),
+            Duration::ZERO,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(task.await.unwrap().len(), 2);
+        assert_eq!(std::fs::read(archive).unwrap(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn storage_failure_does_not_evict_valid_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot("https://example.com");
+        let archive = dir.path().join(&snapshot.file_name);
+        std::fs::write(&archive, b"cached").unwrap();
+        for errno in [13, 28, 5] {
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno));
+            invalidate_bad_archive(&snapshot, dir.path(), &error)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&archive).unwrap(), b"cached");
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_cache_keeps_transport_recovery_without_cache_reads() {
+        let (url, task) = server(vec![response(
+            "200 OK",
+            "Content-Length: 8\r\nETag: \"same\"\r\n",
+            "abcdefgh",
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        std::fs::write(
+            dir.path().join("snapshot-1-test.tar.zst.complete.json"),
+            b"invalid",
+        )
+        .unwrap();
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&url),
+            dir.path(),
+            Duration::ZERO,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(task.await.unwrap().len(), 1);
+        assert!(
+            !dir.path()
+                .join("snapshot-1-test.tar.zst.complete.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn cache_requires_both_explicit_flags() {
+        assert!(!cache_requested(None, Some("true")).unwrap());
+        assert!(!cache_requested(Some("false"), Some("true")).unwrap());
+        assert!(cache_requested(Some("true"), Some("1")).unwrap());
+        assert!(cache_requested(Some("true"), None).is_err());
+        assert!(cache_requested(Some("true"), Some("false")).is_err());
+        assert!(cache_requested(Some("invalid"), Some("true")).is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_etag_in_valid_json_is_a_cache_miss() {
+        let (url, task) = server(vec![response(
+            "200 OK",
+            "Content-Length: 8\r\nETag: \"same\"\r\n",
+            "abcdefgh",
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("snapshot-1-test.tar.zst"), b"abcdefgh").unwrap();
+        let record = serde_json::json!({"filename":"snapshot-1-test.tar.zst","slot":1,"source":format!("{url}/"),"etag":"\"bad\netag\"","bytes":8});
+        std::fs::write(
+            dir.path().join("snapshot-1-test.tar.zst.complete.json"),
+            record.to_string(),
+        )
+        .unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        download_with_client(
+            &client,
+            &url,
+            &url,
+            &snapshot(&url),
+            dir.path(),
+            Duration::ZERO,
+            true,
+        )
+        .await
+        .unwrap();
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].contains("range:"));
     }
 
     #[test]
@@ -470,6 +1106,7 @@ mod tests {
             &snapshot(&download_url),
             dir.path(),
             Duration::ZERO,
+            true,
         )
         .await
         .unwrap();

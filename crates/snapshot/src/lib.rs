@@ -77,6 +77,11 @@ pub async fn run(
 
     tracing::info!("Snapshot data: {:?}", snapshot_pair);
 
+    // Keep restart caching and PVC cleanup inside the opt-in fork boundary.
+    if download_recovery::cache_enabled()? {
+        download_recovery::prepare_cache(&snapshot_pair).await?;
+    }
+
     // Download and process the snapshots
     let full_snapshot_handle = download_and_process_snapshot(
         snapshot_pair.downloading_endpoint.clone(),
@@ -216,7 +221,11 @@ async fn process_downloaded_snapshot(
         account_files: solana_snapshot,
         stake_data,
         bank_info,
-    } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_data.slot)?;
+    } = if download_recovery::cache_enabled()? {
+        download_recovery::unpack(&snapshot_data, &base_dir).await?
+    } else {
+        sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_data.slot)?
+    };
 
     if let Err(e) = db_queries::persist_epoch_stakes(database, &stake_data).await {
         tracing::error!("Failed to persist epoch stakes from snapshot: {:?}", e);
