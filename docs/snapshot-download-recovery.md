@@ -62,6 +62,36 @@ Cleanup happens before the full/incremental tasks start and does not follow
 symlinks. A new incremental can reuse its unchanged full base; a different full
 base removes the old cache. Run one indexer per snapshot directory/PVC.
 
+## Pre-populating the PVC
+
+A separate tool can download/upload archives before an indexer rollout without
+changing Cloudbreak. Place the archive under `/data/snapshot_<slot>/<filename>`
+and publish one sibling `<filename>.complete.json` only after the upload completes:
+
+```json
+{
+  "filename": "snapshot-123-example.tar.zst",
+  "slot": 123,
+  "source": "https://provider.example/mainnet-beta/snapshot-123-example.tar.zst",
+  "etag": "\"the-provider-strong-etag\"",
+  "bytes": 123456789
+}
+```
+
+Use the ETag and full Content-Length observed while downloading that exact object,
+not values guessed from a pre-existing local file. `source` is the selected download
+URL with query, fragment and user credentials removed. Upload to a temporary name,
+then atomically rename the complete archive and finally its marker. The ETag is an
+opaque object validator; multipart ETags are not local-file MD5 checksums.
+
+The marker is a trusted assertion from the downloader that it finished transferring
+the object. Cloudbreak checks local length and remote identity; it does not hash
+all archive bytes on restart. A bare archive is intentionally not reused. If an
+upload tool cannot publish this record, Cloudbreak downloads once to establish it.
+The tracker must still select the matching full base in a pair covering the new
+startup slot; uploading an old full/incremental pair does not force its selection.
+Unpacking, ingestion and database startup cleanup still run after cache reuse.
+
 ## Deployment boundary
 
 The startup script must preserve `/data/snapshot_*` when recovery is enabled.
