@@ -87,37 +87,48 @@ pub(super) async fn prepare(root: &Path, pair: &SnapshotPair) -> anyhow::Result<
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+pub(super) enum Probe {
+    Hit,
+    Miss,
+    Retry,
+    RefreshUrl,
+}
+
 pub(super) async fn reuse(
     client: &Client,
     url: &str,
     snapshot: &SnapshotData,
     directory: &Path,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Probe> {
     let record = match tokio::fs::read(directory.join(marker(snapshot))).await {
         Ok(bytes) => match serde_json::from_slice::<Completion>(&bytes) {
             Ok(record) => record,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(Probe::Miss),
         },
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Probe::Miss),
         Err(error) => return Err(error.into()),
     };
     if record.filename != snapshot.file_name
         || record.slot != snapshot.slot
         || record.source != source(url)?
         || record.bytes == 0
+        || !record.etag.starts_with('"')
+        || !record.etag.ends_with('"')
+        || header::HeaderValue::from_str(&record.etag).is_err()
     {
-        return Ok(false);
+        return Ok(Probe::Miss);
     }
     let metadata = match tokio::fs::symlink_metadata(directory.join(&snapshot.file_name)).await {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Probe::Miss),
         Err(error) => return Err(error.into()),
     };
     if !metadata.is_file() || metadata.len() != record.bytes {
-        return Ok(false);
+        return Ok(Probe::Miss);
     }
     // A presigned GET URL may reject HEAD. Probe without transferring the archive.
-    // Expiry, missing validators and network failures are conservative cache misses.
+    // Do not evict a completed archive while its remote identity is uncertain.
     let response = match client
         .get(url)
         .header(header::ACCEPT_ENCODING, "identity")
@@ -128,8 +139,17 @@ pub(super) async fn reuse(
         .await
     {
         Ok(response) => response,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(Probe::Retry),
     };
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        return Ok(Probe::RefreshUrl);
+    }
+    if response.status().is_server_error() || response.status() == StatusCode::TOO_MANY_REQUESTS {
+        return Ok(Probe::Retry);
+    }
     let length = response
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -147,12 +167,19 @@ pub(super) async fn reuse(
         }
         _ => false,
     };
-    Ok(matching_size
+    let matches = matching_size
         && response
             .headers()
             .get(header::ETAG)
             .and_then(|v| v.to_str().ok())
-            == Some(record.etag.as_str()))
+            == Some(record.etag.as_str());
+    Ok(if matches { Probe::Hit } else { Probe::Miss })
+}
+
+/// Persist directory entries after rename so completed downloads survive node failures.
+pub(super) async fn sync_directory(directory: &Path) -> anyhow::Result<()> {
+    tokio::fs::File::open(directory).await?.sync_all().await?;
+    Ok(())
 }
 
 pub(super) async fn publish(
@@ -176,7 +203,7 @@ pub(super) async fn publish(
     tokio::fs::write(&temporary, serde_json::to_vec(&record)?).await?;
     tokio::fs::File::open(&temporary).await?.sync_all().await?;
     tokio::fs::rename(temporary, path).await?;
-    Ok(())
+    sync_directory(directory).await
 }
 
 pub(super) async fn invalidate(snapshot: &SnapshotData, directory: &Path) -> anyhow::Result<()> {

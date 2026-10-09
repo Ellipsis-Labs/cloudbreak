@@ -42,8 +42,13 @@ retained for dashboard parsing.
 
 ## Completed archive cache and PVC cleanup
 
-Recovery also reuses completed downloads across restarts. A completed archive is
-synced and atomically renamed before a completion marker is published. The marker
+Set `CLOUDBREAK_SNAPSHOT_CACHE=true` **in addition to recovery** to reuse completed
+downloads across restarts. Cache defaults off so older retry-only images and their
+startup scripts can be rolled back safely. Invalid values or cache without
+recovery are configuration errors. A completed archive is
+synced and atomically renamed before a completion marker is published. Parent
+directories are synced after creation and after each rename so the archive is
+durable before its completion marker. The marker
 records filename, slot, source URL without credentials/query/fragment, byte length
 and strong ETag. Files without a marker (including downloads from older images),
 partial files, malformed markers and size mismatches are never reused.
@@ -51,8 +56,18 @@ partial files, malformed markers and size mismatches are never reused.
 Reuse probes the selected remote object with `GET`, `Range: bytes=0-0` and
 `If-Match`. The ETag and total length must still match. This works with URLs signed
 for GET, whose signatures may reject HEAD. Changing signed query parameters does
-not invalidate the resource identity. Missing validators, failed probes or changed
-sources cause a fresh download. No cross-process partial-download resume is added.
+not invalidate the resource identity. Network errors, HTTP 429/5xx, and expired
+URLs trigger bounded validation retries and signed-URL refresh while retaining
+the completed archive. If validation remains uncertain, startup fails with the
+archive intact for the next attempt. Confirmed identity/size mismatches or missing
+validators cause a fresh download. No cross-process partial-download resume is added.
+
+The cache wrapper invalidates an archive and its marker on unpacking/metadata
+validation errors, allowing the next startup to fetch it again. Storage errors
+such as permission failures, full disks and device errors preserve the archive;
+fixing the storage problem need not repeat the download. Later database errors
+never evict downloaded archives. The indexer's existing global panic hook exits
+on failed bootstrap; global panic behavior and indexing logic are unchanged.
 
 After the tracker selects a startup pair covering the new received slot, the
 indexer retains only that pair's named archives and markers. Obsolete numeric
@@ -94,10 +109,12 @@ Unpacking, ingestion and database startup cleanup still run after cache reuse.
 
 ## Deployment boundary
 
-The startup script must preserve `/data/snapshot_*` when recovery is enabled.
-Deploy an image containing this cache implementation before enabling retention;
+The startup script must preserve `/data/snapshot_*` only when both recovery and
+cache are enabled.
+Enable `CLOUDBREAK_SNAPSHOT_CACHE=true` together with an image containing this
+cache implementation;
 the old recovery implementation has no startup cache pruning. Keep the original
-snapshot deletion when recovery is disabled. Tracker-response files can still be
+snapshot deletion when either flag is disabled. Tracker-response files can still be
 removed on every start.
 
 Database rebuild policy is unchanged: `cloudbreak-migration fresh`, archive
@@ -117,3 +134,7 @@ These fixtures do not verify an external provider's live range behavior.
 Cache fixtures also cover restart reuse with renewed signed queries, remote ETag
 changes, truncated/unmarked archives, corrupt markers, changed sources, failed
 probes, selected-pair PVC pruning and symlink-safe cleanup.
+
+Review regression fixtures cover transient/expired cache probes without refetching,
+exhausted validation preserving archives, corrupt archive eviction/refetch, storage
+failures preserving archives, and the cache-disabled transport recovery path.

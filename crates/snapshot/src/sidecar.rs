@@ -429,8 +429,7 @@ pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
         .with_limit(MAX_STREAM_SIZE)
         .with_fixint_encoding()
         .allow_trailing_bytes()
-        .deserialize_from(&mut snapshot_stream)
-        .unwrap();
+        .deserialize_from(&mut snapshot_stream)?;
 
     let elapsed = start_time.elapsed().as_secs_f64() - elapsed;
     tracing::info!(target: "unpack_compressed_snapshot", "Deserialized AccountsDbFields Vec in {} seconds", elapsed);
@@ -457,8 +456,14 @@ pub fn unpack_compressed_snapshot<P: Into<PathBuf>>(
 
     let AccountsDbFields(accounts_metadata, _, accountsdb_fields_slot, ..) = accounts_db_fields;
 
-    assert_eq!(slot, accountsdb_fields_slot);
-    assert_eq!(slot, bank_fields.slot);
+    anyhow::ensure!(
+        slot == accountsdb_fields_slot,
+        "Snapshot accounts metadata slot does not match selected slot"
+    );
+    anyhow::ensure!(
+        slot == bank_fields.slot,
+        "Snapshot bank slot does not match selected slot"
+    );
 
     // Deserializing the accounts directory files
     let accounts_dir = temp_dir.join("accounts");
