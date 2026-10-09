@@ -32,6 +32,7 @@ use crate::{
 
 pub mod accountsdb_helpers;
 mod db_queries;
+mod download_recovery;
 pub mod lt_hash;
 pub mod metrics;
 pub mod sidecar;
@@ -156,14 +157,25 @@ fn download_and_process_snapshot(
 
     tokio::spawn(async move {
         let base_dir = sidecar::snapshot_base_dir(snapshot_data.slot);
-        download_snapshot_file(
-            &sidecar_endpoint,
-            snapshot_data.clone(),
-            snapshot_type,
-            &base_dir,
-        )
-        .await
-        .inspect_err(|e| {
+        let recovery = std::env::var("CLOUDBREAK_SNAPSHOT_DOWNLOAD_RECOVERY").ok();
+        let download = if download_recovery::enabled(recovery.as_deref())? {
+            download_recovery::download(
+                &sidecar_endpoint,
+                &config.tracker_endpoint.endpoint,
+                &snapshot_data,
+                &base_dir,
+            )
+            .await
+        } else {
+            download_snapshot_file(
+                &sidecar_endpoint,
+                snapshot_data.clone(),
+                snapshot_type,
+                &base_dir,
+            )
+            .await
+        };
+        download.inspect_err(|e| {
             tracing::error!("Failed to download snapshot: {:?} ({:?})", e, snapshot_type);
         })?;
 
