@@ -77,6 +77,13 @@ pub async fn run(
 
     tracing::info!("Snapshot data: {:?}", snapshot_pair);
 
+    // Keep restart caching and PVC cleanup inside the opt-in fork boundary.
+    if download_recovery::enabled(
+        std::env::var("CLOUDBREAK_SNAPSHOT_DOWNLOAD_RECOVERY").ok().as_deref(),
+    )? {
+        download_recovery::prepare_cache(&snapshot_pair).await?;
+    }
+
     // Download and process the snapshots
     let full_snapshot_handle = download_and_process_snapshot(
         snapshot_pair.downloading_endpoint.clone(),

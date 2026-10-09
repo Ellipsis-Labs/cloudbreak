@@ -40,20 +40,42 @@ Retry and progress logs include byte counts and snapshot type. Signed URLs are
 omitted from request errors. Existing download-size/progress message formats are
 retained for dashboard parsing.
 
+## Completed archive cache and PVC cleanup
+
+Recovery also reuses completed downloads across restarts. A completed archive is
+synced and atomically renamed before a completion marker is published. The marker
+records filename, slot, source URL without credentials/query/fragment, byte length
+and strong ETag. Files without a marker (including downloads from older images),
+partial files, malformed markers and size mismatches are never reused.
+
+Reuse probes the selected remote object with `GET`, `Range: bytes=0-0` and
+`If-Match`. The ETag and total length must still match. This works with URLs signed
+for GET, whose signatures may reject HEAD. Changing signed query parameters does
+not invalidate the resource identity. Missing validators, failed probes or changed
+sources cause a fresh download. No cross-process partial-download resume is added.
+
+After the tracker selects a startup pair covering the new received slot, the
+indexer retains only that pair's named archives and markers. Obsolete numeric
+`snapshot_<slot>` and timestamped snapshot directories are deleted, along with
+partial files, obsolete filenames and extraction directories in retained slots.
+Cleanup happens before the full/incremental tasks start and does not follow
+symlinks. A new incremental can reuse its unchanged full base; a different full
+base removes the old cache. Run one indexer per snapshot directory/PVC.
+
 ## Deployment boundary
 
-This recovers downloads **inside a running process**, not across pod/container
-restarts. The current infrastructure startup script deletes snapshot directories
-and runs `cloudbreak-migration fresh` on every start. This PR does not change
-those database rebuild or restart policies, disable health checks, or enable
-recovery in production.
+The startup script must preserve `/data/snapshot_*` when recovery is enabled.
+Deploy an image containing this cache implementation before enabling retention;
+the old recovery implementation has no startup cache pruning. Keep the original
+snapshot deletion when recovery is disabled. Tracker-response files can still be
+removed on every start.
 
-A rollout therefore still rebuilds the index. Allow it to bootstrap before
-routing traffic, or validate on an inactive independent stack. After enabling,
-a transient download failure should log a retry and retain the byte offset;
-container restart counts should remain unchanged. The service remains unhealthy
-until snapshot processing and cleanup finish. Exhausted retries still propagate
-to the existing restart path.
+Database rebuild policy is unchanged: `cloudbreak-migration fresh`, archive
+unpacking, account ingestion, indexes and startup cleanup still run. Cache reuse
+saves download time, not total bootstrap time. The service remains unhealthy
+until processing and cleanup complete. A rollout therefore still rebuilds the
+index; validate on an inactive independent stack or allow bootstrap before routing
+traffic. No live deployment is required to validate the cache with local fixtures.
 
 ## Checks
 
@@ -61,3 +83,7 @@ to the existing restart path.
 truncated bodies, validated range resumption, ignored ranges, missing validators,
 changed ETags, wrong offsets, expiring URLs, snapshot identity and retry limits.
 These fixtures do not verify an external provider's live range behavior.
+
+Cache fixtures also cover restart reuse with renewed signed queries, remote ETag
+changes, truncated/unmarked archives, corrupt markers, changed sources, failed
+probes, selected-pair PVC pruning and symlink-safe cleanup.
