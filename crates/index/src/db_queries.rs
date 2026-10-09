@@ -9,7 +9,7 @@ use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
 use cloudbreak_entity::{accounts, slots};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    Statement, Value,
+    Statement, TransactionTrait, Value,
 };
 use tokio::{
     task::JoinHandle,
@@ -148,16 +148,19 @@ pub async fn insert_slot(
     blockhash: Option<&str>,
     commitment: CommitmentLevel,
     healthy: bool,
+    transaction_count: Option<u64>,
     db: &DatabaseConnection,
     config: &IndexConfig,
-) {
+) -> bool {
     let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
 
     let block_time = block_time.unwrap_or_default().timestamp;
 
     // `health` is stamped only on insert. `update_service_health` owns it on existing rows.
     // The `slots_notify` trigger sends this row to the API slot syncronizer on every real change.
-    let query = db.execute(Statement::from_sql_and_values(
+    let query = async {
+        let txn = db.begin().await?;
+        let result = txn.execute(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"INSERT INTO slots (slot, commitment, block_time, health, blockhash)
            VALUES ($1, $2, $3, $4, $5)
@@ -171,7 +174,21 @@ pub async fn insert_slot(
             Value::from(healthy),
             Value::from(blockhash.map(str::to_string)),
         ],
-    ));
+    )).await?;
+        if let (CommitmentLevel::Confirmed, Some(count), Some(hash)) =
+            (commitment, transaction_count, blockhash)
+        {
+            if !hash.is_empty() {
+                txn.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO atomic_account_checkpoint (id, slot, transaction_count, blockhash) VALUES (1, $1, $2, $3) ON CONFLICT (id) DO UPDATE SET slot = EXCLUDED.slot, transaction_count = EXCLUDED.transaction_count, blockhash = EXCLUDED.blockhash WHERE EXCLUDED.slot > atomic_account_checkpoint.slot",
+                    [Value::from(slot as i64), Value::from(count as i64), Value::from(hash)],
+                )).await?;
+            }
+        }
+        txn.commit().await?;
+        Ok::<_, sea_orm::DbErr>(result)
+    };
 
     let result = timeout(query_timeout, query)
         .await
@@ -182,14 +199,18 @@ pub async fn insert_slot(
         });
 
     match result {
-        Ok(res) => tracing::debug!(
-            "insert_slot: slot {}, rows affected {}",
-            slot,
-            res.rows_affected()
-        ),
+        Ok(res) => {
+            tracing::debug!(
+                "insert_slot: slot {}, rows affected {}",
+                slot,
+                res.rows_affected()
+            );
+            true
+        }
         Err(e) => {
             tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
             metrics::increment_db_errors();
+            false
         }
     }
 }
@@ -245,7 +266,6 @@ pub async fn insert_recent_blockhash(
         metrics::increment_db_errors();
     }
 }
-
 
 /// The latest persisted slot for each commitment level, plus the finalized→confirmed lag.
 ///

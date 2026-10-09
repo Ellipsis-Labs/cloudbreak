@@ -77,7 +77,7 @@ pub async fn get_account_info(
     let owner = account.owner;
 
     // Post-query indexer-filter check: if this owner is excluded by the current indexer filter error.
-    if !state.indexer_filter.is_program_selected(&owner) {
+    if !state.indexer_filter.is_account_selected(&pubkey, &owner) {
         return Err(RpcError::AccountOwnerExcluded {
             pubkey: pubkey.to_string(),
             owner: owner.to_string(),

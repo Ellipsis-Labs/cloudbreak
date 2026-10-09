@@ -97,6 +97,8 @@ impl RequestContext {
 
 #[derive(Clone)]
 pub struct CloudbreakRpcState {
+    pub phoenix_accounts: Option<cloudbreak_core::PhoenixAccountsConfig>,
+    pub phoenix_snapshots: Arc<crate::methods::phoenix_accounts::SnapshotWorker>,
     pub database: DatabaseConnection,
     pub query_tracker_client: Option<QueryTrackerClient>,
     pub queries_timeout: Duration,
@@ -153,6 +155,8 @@ impl CloudbreakRpcState {
         processed: ProcessedAccounts,
     ) -> Self {
         Self {
+            phoenix_accounts: None,
+            phoenix_snapshots: Arc::new(crate::methods::phoenix_accounts::SnapshotWorker::default()),
             database,
             queries_timeout,
             slot_syncronizer_data,

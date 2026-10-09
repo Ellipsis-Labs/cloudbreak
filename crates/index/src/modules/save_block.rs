@@ -44,6 +44,7 @@ pub async fn save_block(
     let max_chunk_bytes_data = config.grpc.max_chunk_bytes_data;
 
     let slot = block.slot;
+    let transaction_count = block.executed_transaction_count;
     let is_repaired = block.blockhash.is_empty();
 
     modules::snapshot::process_snapshot_if_needed(
@@ -71,19 +72,6 @@ pub async fn save_block(
     let capture_owners = accounts_owner_map.is_enabled();
 
     metrics::record_new_accounts_in_slot(block.accounts.len(), "block_accounts_total");
-
-    let programs_include_filter = config
-        .programs
-        .include
-        .iter()
-        .map(|pubkey| pubkey.0.to_bytes().to_vec())
-        .collect::<Vec<_>>();
-    let programs_exclude_filter = config
-        .programs
-        .exclude
-        .iter()
-        .map(|pubkey| pubkey.0.to_bytes().to_vec())
-        .collect::<Vec<_>>();
 
     // The stake map goes first so the trackers below see this block's membership.
     // Each returns empty when its feature is disabled.
@@ -119,14 +107,8 @@ pub async fn save_block(
             continue;
         }
 
-        let mut is_new_owner_included = true;
-        if !programs_include_filter.is_empty() {
-            if !programs_include_filter.contains(&account.owner) {
-                is_new_owner_included = false;
-            }
-        } else if programs_exclude_filter.contains(&account.owner) {
-            is_new_owner_included = false;
-        }
+        let owner = Pubkey::try_from(account.owner.as_slice()).expect("valid account owner");
+        let is_new_owner_included = config.programs.is_account_selected(&pubkey, &owner);
 
         if accounts_owner_map.account_to_be_deleted(
             &account.pubkey,
@@ -205,24 +187,6 @@ pub async fn save_block(
         || snapshot_processing_state == SnapshotProcessingState::FinishedAndCleanedUp)
         .then(|| closed_accounts_for_slot.clone());
 
-    // Record the block data in the finalizer map (keyed by slot). It is held there until the slot
-    // is finalized (via a finalized notification or the ancestor walk). For snapshot-repaired
-    // blocks the chain fields are empty/zero.
-    slot_finalizer.record_block(
-        slot,
-        AccountsReceivedPerBlock {
-            block_time: block.block_time,
-            accounts: updated_accounts_for_slot,
-            accounts_owners: updated_accounts_owners_for_slot,
-            closed_accounts: closed_accounts_for_slot,
-            closed_cleanup_pubkeys,
-            closed_cleanup_owners,
-        },
-        block.blockhash.clone(),
-        block.parent_slot,
-        block.parent_blockhash.clone(),
-    );
-
     let chunks_length = chunks.len();
     tracing::debug!(target: "chunks_length", "chunks_length: {}", chunks_length);
 
@@ -284,17 +248,46 @@ pub async fn save_block(
         .persist_block(&stake_block, db, &config)
         .await;
 
+    if !block_writes_ok {
+        db_queries::update_service_health(db, false).await;
+        panic!("Refusing to publish incomplete account state for slot {slot}");
+    }
+
     // Wait until the chunk processing is finished to insert the slot (this ensures that gPA calls can only read from completed slots)
-    db_queries::insert_slot(
+    let published = db_queries::insert_slot(
         slot,
         block.block_time,
         Some(&block.blockhash),
         CommitmentLevel::Confirmed,
         updated_accounts_during_startup.health.is_healthy(),
+        (!is_repaired).then_some(transaction_count),
         db,
         &config,
     )
     .await;
+
+    if !published {
+        db_queries::update_service_health(db, false).await;
+        panic!("Failed to publish complete account checkpoint for slot {slot}");
+    }
+
+    // Only expose successfully published blocks to the finalizer map (keyed by slot). It is held there until the slot
+    // is finalized (via a finalized notification or the ancestor walk). For snapshot-repaired
+    // blocks the chain fields are empty/zero.
+    slot_finalizer.record_block(
+        slot,
+        AccountsReceivedPerBlock {
+            block_time: block.block_time,
+            accounts: updated_accounts_for_slot,
+            accounts_owners: updated_accounts_owners_for_slot,
+            closed_accounts: closed_accounts_for_slot,
+            closed_cleanup_pubkeys,
+            closed_cleanup_owners,
+        },
+        block.blockhash.clone(),
+        block.parent_slot,
+        block.parent_blockhash.clone(),
+    );
 
     db_queries::insert_recent_blockhash(
         slot,

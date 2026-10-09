@@ -23,6 +23,7 @@ pub mod mint;
 pub mod mint_accounts;
 pub(crate) mod processed;
 pub mod program;
+pub mod phoenix_accounts;
 pub mod simulate_transaction;
 pub mod slot;
 pub mod token;

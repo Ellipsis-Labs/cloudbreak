@@ -98,7 +98,7 @@ pub async fn get_multiple_accounts(
         let owner = account.owner;
 
         // Per-position indexer-filter check: if the owner is excluded, we return None at that position and log a tracing error.
-        if !state.indexer_filter.is_program_selected(&owner) {
+        if !state.indexer_filter.is_account_selected(&pubkey, &owner) {
             tracing::error!(
                 target: "gma_indexer_filter",
                 pubkey = %pubkey,

@@ -53,7 +53,7 @@ pub async fn get_token_account_balance(
 
     let owner = account.owner;
 
-    if !state.indexer_filter.is_program_selected(&owner) {
+    if !state.indexer_filter.is_account_selected(&pubkey, &owner) {
         return Err(RpcError::AccountOwnerExcluded {
             pubkey: pubkey.to_string(),
             owner: owner.to_string(),

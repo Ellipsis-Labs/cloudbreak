@@ -19,7 +19,7 @@ authors = [
 phoenix-telemetry = { workspace = true }
 rustls = { workspace = true }
 cloudbreak-core = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 sea-orm = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

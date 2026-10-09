@@ -51,7 +51,7 @@ impl SlotBlock {
                 skipped += 1;
                 continue;
             };
-            let entry = if account.lamports == 0 || !program_filter.is_program_selected(&owner) {
+            let entry = if account.lamports == 0 || !program_filter.is_account_selected(&pubkey, &owner) {
                 AccountEntry::Closed
             } else {
                 data_bytes += account.data.len();
@@ -143,6 +143,7 @@ pub(crate) mod tests {
         let included = Pubkey::new_unique();
         let excluded = Pubkey::new_unique();
         let filter = AccountSelectorConfig {
+            accounts: vec![],
             include: vec![PubkeyDef(included)],
             exclude: vec![],
         };

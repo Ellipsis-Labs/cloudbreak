@@ -131,6 +131,9 @@ impl<'de> Deserialize<'de> for PubkeyDef {
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct AccountSelectorConfig {
+    /// Exact accounts included regardless of their program owner (e.g. token vaults).
+    #[serde(rename = "accounts", default)]
+    pub accounts: Vec<PubkeyDef>,
     #[serde(default)]
     pub include: Vec<PubkeyDef>,
     #[serde(default)]
@@ -138,6 +141,10 @@ pub struct AccountSelectorConfig {
 }
 
 impl AccountSelectorConfig {
+    pub fn is_account_selected(&self, pubkey: &Pubkey, owner: &Pubkey) -> bool {
+        self.accounts.iter().any(|key| key.0 == *pubkey) || self.is_program_selected(owner)
+    }
+
     pub fn is_program_selected(&self, program: &Pubkey) -> bool {
         if self.include.is_empty() {
             !self.exclude.iter().any(|p| &p.0 == program)
@@ -182,9 +189,9 @@ impl EnvironmentInfo {
 
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "INSERT INTO environment_info (id, mode, programs) VALUES (1, $1, $2) \
-             ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs",
-            [mode.into(), programs_csv.into()],
+            "INSERT INTO environment_info (id, mode, programs, accounts) VALUES (1, $1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs, accounts = EXCLUDED.accounts",
+            [mode.into(), programs_csv.into(), filters.accounts.iter().map(|p| p.0.to_string()).collect::<Vec<_>>().join(",").into()],
         ))
         .await?;
 
@@ -195,7 +202,7 @@ impl EnvironmentInfo {
         let row = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "SELECT mode, programs FROM environment_info WHERE id = 1".to_string(),
+                "SELECT mode, programs, accounts FROM environment_info WHERE id = 1".to_string(),
             ))
             .await?
             .ok_or_else(|| {
@@ -211,12 +218,21 @@ impl EnvironmentInfo {
             .map(|s| Pubkey::from_str(s).map(PubkeyDef))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let accounts: String = row.try_get("", "accounts")?;
+        let accounts = accounts
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| Pubkey::from_str(s).map(PubkeyDef))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         Ok(match mode.as_str() {
             "include" => AccountSelectorConfig {
+                accounts,
                 include: programs,
                 exclude: Vec::new(),
             },
             "exclude" => AccountSelectorConfig {
+                accounts,
                 include: Vec::new(),
                 exclude: programs,
             },
@@ -443,7 +459,10 @@ pub struct SupplyConfig {
     pub enabled: bool,
     /// Accounts kept resident in the hot-accounts map, about 65 bytes each.
     /// Stake accounts live in the non-circulating stake map instead.
-    #[serde(rename = "hot-accounts", default = "SupplyConfig::default_hot_accounts")]
+    #[serde(
+        rename = "hot-accounts",
+        default = "SupplyConfig::default_hot_accounts"
+    )]
     pub hot_accounts: usize,
 }
 
@@ -723,6 +742,8 @@ pub enum UnhealthyResponseBehavior {
 
 #[derive(Deserialize, Debug)]
 pub struct ApiConfig {
+    #[serde(rename = "phoenix-accounts", default)]
+    pub phoenix_accounts: Option<PhoenixAccountsConfig>,
     pub database: DatabaseConfig,
     pub server: ServerConfig,
     pub metrics: MetricsConfig,
@@ -1685,6 +1706,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_accounts_override_owner_filters_without_expanding_program_coverage() {
+        let key = Pubkey::new_from_array([1; 32]);
+        let owner = Pubkey::new_from_array([2; 32]);
+        let filters = AccountSelectorConfig {
+            accounts: vec![PubkeyDef(key)],
+            include: vec![PubkeyDef(Pubkey::new_from_array([3; 32]))],
+            exclude: vec![],
+        };
+        assert!(filters.is_account_selected(&key, &owner));
+        assert!(!filters.is_program_selected(&owner));
+        assert!(!filters.is_account_selected(&Pubkey::new_from_array([4; 32]), &owner));
+    }
+
     use super::*;
 
     // The eviction feature drops database indexes, so its defaults are a safety contract: it must
@@ -1761,4 +1796,24 @@ url = "postgres://localhost/cloudbreak"
             .to_string();
         assert!(err.contains("slot-syncronizer"), "{err}");
     }
+}
+
+/// Program/account coverage for an atomic confirmed-slot snapshot.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PhoenixAccountsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Phoenix and Ember program IDs; every account owned by these is returned.
+    #[serde(default)]
+    pub program_ids: Vec<PubkeyDef>,
+    #[serde(default)]
+    pub additional_program_ids: Vec<PubkeyDef>,
+    #[serde(default)]
+    pub twap_program_ids: Vec<PubkeyDef>,
+    #[serde(default)]
+    pub include_twap: bool,
+    /// Exact vault keys, indexed with [programs].accounts.
+    #[serde(default)]
+    pub vault_accounts: Vec<PubkeyDef>,
 }

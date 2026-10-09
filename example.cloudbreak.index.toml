@@ -73,6 +73,8 @@ host = "0.0.0.0"
 port = 8875
 
 [programs]
+# Exact token vault keys to retain alongside program-owned accounts.
+# accounts = ["<vault-pubkey>"]
 include = ["Stake11111111111111111111111111111111111111"]
 
 # getLargestAccounts (GLA) and getTokenLargestAccounts (GTLA) are enabled

@@ -104,6 +104,7 @@ mod tests {
         let other = Pubkey::new_unique();
         let mut chain = TestChain::new();
         chain.filter = AccountSelectorConfig {
+            accounts: vec![],
             include: vec![PubkeyDef(selected)],
             exclude: vec![],
         };

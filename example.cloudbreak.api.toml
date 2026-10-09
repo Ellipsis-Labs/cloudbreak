@@ -125,3 +125,13 @@ min-bytes-per-query = 1_048_576 # 1MB
 
 # [token-largest-accounts]
 # enabled = true
+
+# Atomic confirmed end-of-slot snapshots (opt-in). See docs/phoenix-accounts.md.
+# Clients may add fully indexed programs with the RPC additionalProgramIds option.
+# [phoenix-accounts]
+# enabled = true
+# program-ids = ["EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih", "phDEVv4w6BcfkLrLNeXr8HhhgQxnxziVGXpGPcaadMf"]
+# additional-program-ids = [] # Ember and Flight deployments to include
+# twap-program-ids = []
+# include-twap = false
+# vault-accounts = [] # required exact SPL Token vault keys

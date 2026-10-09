@@ -127,7 +127,7 @@ pub async fn get_balance(
 
     let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 
-    if !state.indexer_filter.is_program_selected(&owner) {
+    if !state.indexer_filter.is_account_selected(&pubkey, &owner) {
         return Err(RpcError::AccountOwnerExcluded {
             pubkey: pubkey.to_string(),
             owner: owner.to_string(),

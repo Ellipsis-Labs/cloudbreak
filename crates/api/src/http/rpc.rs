@@ -273,6 +273,40 @@ async fn process_single_request(
 
             json_response
         }
+        "getPhoenixAccounts" => {
+            let config: Option<methods::phoenix_accounts::GetPhoenixAccountsConfig> =
+                match extract_param(&rpc_request.params, 0) {
+                    Ok(config) => config,
+                    Err(e) => return make_error_response(id, -32602, e),
+                };
+            let start = Instant::now();
+            let result =
+                methods::phoenix_accounts::get_phoenix_accounts(state, config.unwrap_or_default())
+                    .await;
+            let (response, metrics_data) = match result {
+                Ok((response, metrics)) => (Ok(response), Some(metrics)),
+                Err(error) => (Err(error), None),
+            };
+            metrics::CLOUDBREAK_API_REQUESTS_TOTAL
+                .with_label_values(&[
+                    "getPhoenixAccounts",
+                    if response.is_ok() { "success" } else { "error" },
+                ])
+                .inc();
+            let json_start = Instant::now();
+            let serialized = json_serialize_response(id, response, ctx).await;
+            if let Some(metrics) = metrics_data {
+                metrics.record_metrics(
+                    json_start.elapsed().as_secs_f64() * 1000.0,
+                    start.elapsed(),
+                    serialized.0.len() as u64,
+                    0,
+                    0.0,
+                    &ctx.subscription_id,
+                );
+            }
+            serialized
+        }
         "getProgramAccounts" => {
             let gpa_global_start_time = Instant::now();
 
@@ -637,7 +671,10 @@ async fn process_single_request(
             json_response
         }
         _ => {
-            let reason = if matches!(method, "getVoteAccounts" | "simulateTransaction" | "getSupply") {
+            let reason = if matches!(
+                method,
+                "getVoteAccounts" | "simulateTransaction" | "getSupply"
+            ) {
                 "not enabled on this node"
             } else {
                 "unknown method"

@@ -41,6 +41,8 @@ futures = { workspace = true }
 bincode = { workspace = true }
 prometheus = { workspace = true }
 lazy_static = { workspace = true }
+wincode = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

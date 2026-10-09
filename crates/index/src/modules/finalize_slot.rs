@@ -409,16 +409,21 @@ async fn finalize_slot(
     cleanup: &CleanupHandle,
 ) {
     // Mark the slot finalized before the cleanup keys are queued, for API query consistency.
-    db_queries::insert_slot(
+    let published = db_queries::insert_slot(
         slot,
         updated_accounts.block_time,
         None,
         CommitmentLevel::Finalized,
         updated_accounts_during_startup.health.is_healthy(),
+        None,
         &db,
         config,
     )
     .await;
+    if !published {
+        db_queries::update_service_health(&db, false).await;
+        panic!("Failed to publish finalized slot {slot}; refusing cleanup");
+    }
 
     updated_accounts_during_startup.cleanup_stored_accounts_once(&db, slot, config);
 
