@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+pub mod account_checkpoint;
 pub mod cleanup;
 pub mod epoch_stakes;
 pub mod finalize_slot;

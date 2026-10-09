@@ -142,22 +142,15 @@ pub fn insert_closed_accounts(
     Some(handle)
 }
 
-pub async fn insert_slot(
+/// Shared upstream slot upsert; extension metadata is published separately.
+pub(crate) fn slot_statement(
     slot: u64,
     block_time: Option<UnixTimestamp>,
     blockhash: Option<&str>,
     commitment: CommitmentLevel,
     healthy: bool,
-    db: &DatabaseConnection,
-    config: &IndexConfig,
-) {
-    let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
-
-    let block_time = block_time.unwrap_or_default().timestamp;
-
-    // `health` is stamped only on insert. `update_service_health` owns it on existing rows.
-    // The `slots_notify` trigger sends this row to the API slot syncronizer on every real change.
-    let query = db.execute(Statement::from_sql_and_values(
+) -> Statement {
+    Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"INSERT INTO slots (slot, commitment, block_time, health, blockhash)
            VALUES ($1, $2, $3, $4, $5)
@@ -167,29 +160,44 @@ pub async fn insert_slot(
         [
             Value::from(slot as i64),
             Value::from(commitment as i32),
-            Value::from(block_time),
+            Value::from(block_time.unwrap_or_default().timestamp),
             Value::from(healthy),
             Value::from(blockhash.map(str::to_string)),
         ],
-    ));
+    )
+}
 
-    let result = timeout(query_timeout, query)
-        .await
-        .unwrap_or_else(|elapsed| {
-            tracing::error!("insert_slot timeout ERROR: {}", elapsed);
-            metrics::increment_db_errors();
-            Err(sea_orm::DbErr::RecordNotInserted)
-        });
-
+pub async fn insert_slot(
+    slot: u64,
+    block_time: Option<UnixTimestamp>,
+    blockhash: Option<&str>,
+    commitment: CommitmentLevel,
+    healthy: bool,
+    db: &DatabaseConnection,
+    config: &IndexConfig,
+) -> bool {
+    let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
+    // `health` is stamped only on insert. `update_service_health` owns existing rows.
+    let result = timeout(
+        query_timeout,
+        db.execute(slot_statement(
+            slot, block_time, blockhash, commitment, healthy,
+        )),
+    )
+    .await;
     match result {
-        Ok(res) => tracing::debug!(
-            "insert_slot: slot {}, rows affected {}",
-            slot,
-            res.rows_affected()
-        ),
-        Err(e) => {
-            tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
+        Ok(Ok(res)) => {
+            tracing::debug!(
+                "insert_slot: slot {}, rows affected {}",
+                slot,
+                res.rows_affected()
+            );
+            true
+        }
+        error => {
+            tracing::error!("insert_slot: failed to insert slot {}: {:?}", slot, error);
             metrics::increment_db_errors();
+            false
         }
     }
 }
@@ -245,7 +253,6 @@ pub async fn insert_recent_blockhash(
         metrics::increment_db_errors();
     }
 }
-
 
 /// The latest persisted slot for each commitment level, plus the finalized→confirmed lag.
 ///

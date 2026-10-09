@@ -46,7 +46,9 @@ pub async fn get_balance(
             if let Some(min_context_slot) = config.min_context_slot
                 && blocks.slot < min_context_slot
             {
-                return Err(RpcError::MinContextSlotNotReached { context_slot: blocks.slot });
+                return Err(RpcError::MinContextSlotNotReached {
+                    context_slot: blocks.slot,
+                });
             }
             return Ok(RpcResponse {
                 context: RpcResponseContext {
@@ -127,7 +129,12 @@ pub async fn get_balance(
 
     let owner = Pubkey::try_from(owner_bytes.as_slice()).map_err(|_| RpcError::InternalError)?;
 
-    if !state.indexer_filter.is_program_selected(&owner) {
+    let data: Vec<u8> = row.try_get("data").map_err(|_| RpcError::InternalError)?;
+    if lamports > 0
+        && !state
+            .indexer_filter
+            .is_account_selected(&pubkey, &owner, &data)
+    {
         return Err(RpcError::AccountOwnerExcluded {
             pubkey: pubkey.to_string(),
             owner: owner.to_string(),

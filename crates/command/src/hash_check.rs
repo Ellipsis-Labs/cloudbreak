@@ -244,6 +244,9 @@ fn unpack_snapshots(
 }
 
 fn build_owner_filter(programs: &AccountSelectorConfig) -> String {
+    if !programs.accounts.is_empty() || !programs.token_mint_filters.is_empty() {
+        return String::new(); // The latest version must be chosen before data/key selection.
+    }
     if !programs.include.is_empty() {
         let owner_literals: Vec<String> = programs
             .include
@@ -318,10 +321,16 @@ fn scan_to_prefix_files(
                 {
                     return;
                 }
-                if !programs.is_program_selected(account.owner) {
+                let selected =
+                    programs.is_account_selected(account.pubkey(), account.owner, account.data);
+                if !selected
+                    && programs.accounts.is_empty()
+                    && programs.token_mint_filters.is_empty()
+                {
                     return;
                 }
-                let h = if account.lamports == 0 {
+                let lamports = if selected { account.lamports } else { 0 };
+                let h = if lamports == 0 {
                     [0u8; 32]
                 } else {
                     blake3_account(
@@ -339,7 +348,7 @@ fn scan_to_prefix_files(
                 let _ = w.write_all(&pubkey);
                 let _ = w.write_all(&file_data.slot.to_le_bytes());
                 let _ = w.write_all(&file_data.write_version.to_le_bytes());
-                let _ = w.write_all(&account.lamports.to_le_bytes());
+                let _ = w.write_all(&lamports.to_le_bytes());
                 let _ = w.write_all(&h);
             });
         }
@@ -449,7 +458,13 @@ async fn query_db_prefix(
         let executable: bool = row.try_get_by_index(3)?;
         let data: Vec<u8> = row.try_get_by_index(4)?;
 
-        if lamports <= 0 {
+        if lamports <= 0
+            || !programs.is_account_selected(
+                &solana_pubkey::Pubkey::try_from(pubkey.as_slice())?,
+                &solana_pubkey::Pubkey::try_from(owner.as_slice())?,
+                &data,
+            )
+        {
             continue;
         }
 

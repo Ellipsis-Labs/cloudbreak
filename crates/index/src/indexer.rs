@@ -63,6 +63,16 @@ pub async fn run(config: &str) -> CloudbreakResult<()> {
     panic_handler::start();
 
     let config = IndexConfig::try_load(config)?;
+    config.programs.validate()?;
+    anyhow::ensure!(
+        config.accounts_owner_map_enabled
+            || config
+                .programs
+                .token_mint_filters
+                .iter()
+                .all(|filter| config.programs.is_program_selected(&filter.token_program.0)),
+        "Partial token-mint indexing requires accounts-owner-map-enabled = true to mask token reinitialization"
+    );
 
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()

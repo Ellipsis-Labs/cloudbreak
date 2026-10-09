@@ -179,7 +179,7 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
     processed.spawn(anchor_rx);
     info!("processed accounts: enabled: {}", processed.is_enabled());
 
-    let state = CloudbreakRpcState::new(
+    let mut state = CloudbreakRpcState::new(
         database,
         queries_timeout,
         slot_syncronizer_data,
@@ -202,6 +202,13 @@ pub async fn run(config: &str) -> cloudbreak_core::Result<()> {
         token_largest_accounts,
         processed,
     );
+
+    state.phoenix_accounts = config.phoenix_accounts.clone();
+    if let Some(section) = &state.phoenix_accounts {
+        if section.enabled {
+            methods::phoenix_accounts::validate_config(section, &state)?;
+        }
+    }
 
     info!("Server is starting...");
 

@@ -57,6 +57,7 @@ pub async fn run(
     non_circulating: NonCirculatingTracker,
     supply_tracker: SupplyTracker,
 ) -> Result<()> {
+    config.programs.validate()?;
     let start_time = Instant::now();
 
     let database = Database::connect(ConnectOptions::from(config.database.clone())).await?;
@@ -219,19 +220,7 @@ async fn process_downloaded_snapshot(
 
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
     let accounts_file_concurency = config.accounts_file_concurency.unwrap_or(32);
-    let programs_include = config
-        .programs
-        .include
-        .iter()
-        .map(|p| p.0)
-        .collect::<Vec<_>>();
-    let programs_exclude = config
-        .programs
-        .exclude
-        .iter()
-        .map(|p| p.0)
-        .collect::<Vec<_>>();
-
+    let account_filter = Arc::new(config.programs.clone());
     let total_accounts_files_count = solana_snapshot.len();
     let accounts_files_processed = Arc::new(Mutex::new(0));
     let mut last_log_time = Instant::now();
@@ -252,8 +241,7 @@ async fn process_downloaded_snapshot(
     } in solana_snapshot
     {
         let accounts_count = accounts_count.clone();
-        let programs_include = programs_include.clone();
-        let programs_exclude = programs_exclude.clone();
+        let account_filter = account_filter.clone();
         let database = database.clone();
 
         let percentage_processed =
@@ -338,11 +326,11 @@ async fn process_downloaded_snapshot(
                         account_file_slot,
                     );
 
-                    if !programs_include.is_empty() {
-                        if !programs_include.contains(account.owner) {
-                            return;
-                        }
-                    } else if programs_exclude.contains(account.owner) {
+                    if !account_filter.is_account_selected(
+                        account.pubkey(),
+                        account.owner,
+                        account.data,
+                    ) {
                         return;
                     }
 
@@ -507,6 +495,7 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
     block_sender: Sender<SubscribeUpdateBlock>,
+    accounts_owner_map: AccountOwnerMap,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -517,19 +506,7 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
     } = sidecar::unpack_compressed_snapshot(path, &base_dir, snapshot_slot)?;
     let mut account_file_workers: JoinSet<Result<()>> = JoinSet::new();
     let accounts_file_concurency = config.accounts_file_concurency.unwrap_or(32);
-    let programs_include = config
-        .programs
-        .include
-        .iter()
-        .map(|p| p.0)
-        .collect::<Vec<_>>();
-    let programs_exclude = config
-        .programs
-        .exclude
-        .iter()
-        .map(|p| p.0)
-        .collect::<Vec<_>>();
-
+    let account_filter = Arc::new(config.programs.clone());
     let total_accounts_files_count = solana_snapshot.len();
     let accounts_files_processed = Arc::new(Mutex::new(0));
     let mut last_log_time = Instant::now();
@@ -549,8 +526,8 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
         }
 
         let accounts_count = accounts_count.clone();
-        let programs_include = programs_include.clone();
-        let programs_exclude = programs_exclude.clone();
+        let account_filter = account_filter.clone();
+        let accounts_owner_map = accounts_owner_map.clone();
 
         let percentage_processed =
             *accounts_files_processed.lock().unwrap() * 100 / total_accounts_files_count;
@@ -587,12 +564,15 @@ pub async fn process_downloaded_snapshot_with_gap_filling(
             // Fetch full account data for each offset
             for offset in offsets {
                 accounts.get_stored_account_callback(offset, |account| {
-                    if !programs_include.is_empty() {
-                        // We always include accounts being closed, they are needed for later cleanup of older versions of the accounts
-                        if !programs_include.contains(account.owner) && account.lamports > 0 {
-                            return;
-                        }
-                    } else if programs_exclude.contains(account.owner) {
+                    // Previously selected keys must reach save_block even when their mint/owner changes.
+                    if account.lamports > 0
+                        && !account_filter.is_account_selected(
+                            account.pubkey(),
+                            account.owner,
+                            account.data,
+                        )
+                        && accounts_owner_map.get_owner(account.pubkey()).is_none()
+                    {
                         return;
                     }
 

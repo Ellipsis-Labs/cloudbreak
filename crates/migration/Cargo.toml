@@ -26,3 +26,6 @@ solana-pubkey = { workspace = true }
 hex = { workspace = true }
 cloudbreak-core = { workspace = true }
 sea-orm-migration = { workspace = true, features = ["runtime-tokio-rustls", "sqlx-postgres"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

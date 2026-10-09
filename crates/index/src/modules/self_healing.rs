@@ -344,6 +344,7 @@ impl SelfHealingState {
                     snapshot_pair,
                     snapshot_config,
                     covered_gaps_list.clone(),
+                    indexer_state.accounts_owner_map.clone(),
                 ) {
                     Ok((handle, rx)) => (handle, rx),
                     Err(e) => {
@@ -510,6 +511,7 @@ fn download_and_process_snapshot_for_gap_filling(
     snapshot_pair: SnapshotPair,
     config: SnapshotConfig,
     gaps_list: Vec<u64>,
+    accounts_owner_map: cloudbreak_core::modules::account_owner_map::AccountOwnerMap,
 ) -> Result<
     (
         JoinHandle<Result<(), anyhow::Error>>,
@@ -545,6 +547,7 @@ fn download_and_process_snapshot_for_gap_filling(
             config,
             gaps_list,
             tx,
+            accounts_owner_map,
         )
         .await?;
 

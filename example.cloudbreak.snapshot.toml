@@ -8,6 +8,8 @@ partition-clustering-threshold = 21474836480 # 20GiB
 endpoint = "http://localhost:8458"
 
 [programs]
+# Exact token vault keys to retain alongside program-owned accounts.
+# accounts = ["<vault-pubkey>"]
 include = [
   "reg8X1V65CSdmrtEjMgnXZk96b9SUSQrJ8n1rP1ZMg7",
   "TWM1DdtALRdEFzmiWmPeVY1Cdy6uXHSu6tWtFjE5x2k",
