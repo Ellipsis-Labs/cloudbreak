@@ -72,6 +72,7 @@ pub fn migration_config() -> &'static MigrationConfig {
 
 /// Build the block that creates `table_name` with the requested partitioning shape.
 ///
+/// PostgreSQL 18 requires partitioned parents to be logged; storage-bearing leaves stay unlogged.
 /// Handles the four (hash, list) combinations:
 /// - (false, false) → plain UNLOGGED table, PK is `(pubkey, slot)`.
 /// - (true,  false) → `PARTITION BY HASH (owner)` with `hash_partition_count` buckets, PK is `(owner, pubkey, slot)`.
@@ -99,7 +100,7 @@ pub fn build_create_table_sql(table_name: &str, cfg: &PgOwnerPartitionsConfig) -
                 hash_partition_block(table_name, table_name, cfg.hash_partition_count);
             format!(
                 r#"
-                CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
+                CREATE TABLE IF NOT EXISTS {table_name} (
                     {columns},
                     {primary_key}
                 ) PARTITION BY HASH (owner);
@@ -113,7 +114,7 @@ pub fn build_create_table_sql(table_name: &str, cfg: &PgOwnerPartitionsConfig) -
                 list_partition_block(table_name, &cfg.programs_for_list_partition);
             format!(
                 r#"
-                CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
+                CREATE TABLE IF NOT EXISTS {table_name} (
                     {columns},
                     {primary_key}
                 ) PARTITION BY LIST (owner);
@@ -132,14 +133,14 @@ pub fn build_create_table_sql(table_name: &str, cfg: &PgOwnerPartitionsConfig) -
                 hash_partition_block(table_name, &default_table, cfg.hash_partition_count);
             format!(
                 r#"
-                CREATE UNLOGGED TABLE IF NOT EXISTS {table_name} (
+                CREATE TABLE IF NOT EXISTS {table_name} (
                     {columns},
                     {primary_key}
                 ) PARTITION BY LIST (owner);
 
                 {list_partitions}
 
-                CREATE UNLOGGED TABLE {default_table} PARTITION OF {table_name} DEFAULT
+                CREATE TABLE {default_table} PARTITION OF {table_name} DEFAULT
                     PARTITION BY HASH (owner);
 
                 {hash_partitions}
@@ -203,6 +204,66 @@ mod compatibility_tests {
     use cloudbreak_core::{AccountSelectorConfig, EnvironmentInfo, PubkeyDef};
     use sea_orm_migration::sea_orm::{DatabaseBackend, Statement};
     use solana_pubkey::Pubkey;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via CLOUDBREAK_TEST_DATABASE_URL"]
+    async fn postgresql_18_partition_modes_keep_leaf_tables_unlogged() {
+        let url = std::env::var("CLOUDBREAK_TEST_DATABASE_URL").unwrap();
+        let mut options = sea_orm::ConnectOptions::new(url);
+        options.max_connections(1);
+        let db = sea_orm::Database::connect(options).await.unwrap();
+        let schema = format!("partition_compat_{}", std::process::id());
+        db.execute_unprepared(&format!(
+            "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+        ))
+        .await
+        .unwrap();
+
+        for hash_partitions in [false, true] {
+            for list_partitions in [false, true] {
+                let cfg = PgOwnerPartitionsConfig {
+                    hash_partitions,
+                    list_partitions,
+                    hash_partition_count: 2,
+                    programs_for_list_partition: vec![PubkeyDef(Pubkey::new_from_array([1; 32]))],
+                };
+                for prefix in ["accounts", "snapshot_accounts"] {
+                    let table = format!(
+                        "{prefix}_{}_{}",
+                        u8::from(hash_partitions),
+                        u8::from(list_partitions)
+                    );
+                    db.execute_unprepared(&build_create_table_sql(&table, &cfg))
+                        .await
+                        .unwrap();
+                    // Exercise routing to both a listed program and the default/hash partitions.
+                    for owner in [1u8, 2u8] {
+                        let owner_hex = hex::encode([owner; 32]);
+                        db.execute_unprepared(&format!(
+                            "INSERT INTO {table} (pubkey, owner, lamports, slot, executable, rent_epoch, data, write_version) VALUES ('\\x{owner_hex}', '\\x{owner_hex}', 1, 1, false, 0, '\\x', 1)"
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+        }
+
+        let tables = db.query_all(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT relname, relkind::text, relpersistence::text FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relkind IN ('p', 'r')".to_string(),
+        )).await.unwrap();
+        assert_eq!(tables.len(), 24);
+        for table in tables {
+            let name: String = table.try_get("", "relname").unwrap();
+            let kind: String = table.try_get("", "relkind").unwrap();
+            let persistence: String = table.try_get("", "relpersistence").unwrap();
+            assert_eq!(persistence, if kind == "p" { "p" } else { "u" }, "{name}");
+        }
+        db.execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via CLOUDBREAK_TEST_DATABASE_URL"]
