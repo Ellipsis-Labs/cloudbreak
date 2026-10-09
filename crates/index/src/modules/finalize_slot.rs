@@ -415,7 +415,6 @@ async fn finalize_slot(
         None,
         CommitmentLevel::Finalized,
         updated_accounts_during_startup.health.is_healthy(),
-        None,
         &db,
         config,
     )

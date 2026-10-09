@@ -9,7 +9,7 @@ use cloudbreak_core::{IndexConfig, modules::account_owner_map::AccountOwnerMap};
 use cloudbreak_entity::{accounts, slots};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter,
-    Statement, TransactionTrait, Value,
+    Statement, Value,
 };
 use tokio::{
     task::JoinHandle,
@@ -142,25 +142,15 @@ pub fn insert_closed_accounts(
     Some(handle)
 }
 
-pub async fn insert_slot(
+/// Shared upstream slot upsert; extension metadata is published separately.
+pub(crate) fn slot_statement(
     slot: u64,
     block_time: Option<UnixTimestamp>,
     blockhash: Option<&str>,
     commitment: CommitmentLevel,
     healthy: bool,
-    transaction_count: Option<u64>,
-    db: &DatabaseConnection,
-    config: &IndexConfig,
-) -> bool {
-    let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
-
-    let block_time = block_time.unwrap_or_default().timestamp;
-
-    // `health` is stamped only on insert. `update_service_health` owns it on existing rows.
-    // The `slots_notify` trigger sends this row to the API slot syncronizer on every real change.
-    let query = async {
-        let txn = db.begin().await?;
-        let result = txn.execute(Statement::from_sql_and_values(
+) -> Statement {
+    Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
         r#"INSERT INTO slots (slot, commitment, block_time, health, blockhash)
            VALUES ($1, $2, $3, $4, $5)
@@ -170,36 +160,33 @@ pub async fn insert_slot(
         [
             Value::from(slot as i64),
             Value::from(commitment as i32),
-            Value::from(block_time),
+            Value::from(block_time.unwrap_or_default().timestamp),
             Value::from(healthy),
             Value::from(blockhash.map(str::to_string)),
         ],
-    )).await?;
-        if let (CommitmentLevel::Confirmed, Some(count), Some(hash)) =
-            (commitment, transaction_count, blockhash)
-        {
-            if !hash.is_empty() {
-                txn.execute(Statement::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    "INSERT INTO atomic_account_checkpoint (id, slot, transaction_count, blockhash) VALUES (1, $1, $2, $3) ON CONFLICT (id) DO UPDATE SET slot = EXCLUDED.slot, transaction_count = EXCLUDED.transaction_count, blockhash = EXCLUDED.blockhash WHERE EXCLUDED.slot > atomic_account_checkpoint.slot",
-                    [Value::from(slot as i64), Value::from(count as i64), Value::from(hash)],
-                )).await?;
-            }
-        }
-        txn.commit().await?;
-        Ok::<_, sea_orm::DbErr>(result)
-    };
+    )
+}
 
-    let result = timeout(query_timeout, query)
-        .await
-        .unwrap_or_else(|elapsed| {
-            tracing::error!("insert_slot timeout ERROR: {}", elapsed);
-            metrics::increment_db_errors();
-            Err(sea_orm::DbErr::RecordNotInserted)
-        });
-
+pub async fn insert_slot(
+    slot: u64,
+    block_time: Option<UnixTimestamp>,
+    blockhash: Option<&str>,
+    commitment: CommitmentLevel,
+    healthy: bool,
+    db: &DatabaseConnection,
+    config: &IndexConfig,
+) -> bool {
+    let query_timeout = Duration::from_secs(config.database.finalize_slot_queries_timeout);
+    // `health` is stamped only on insert. `update_service_health` owns existing rows.
+    let result = timeout(
+        query_timeout,
+        db.execute(slot_statement(
+            slot, block_time, blockhash, commitment, healthy,
+        )),
+    )
+    .await;
     match result {
-        Ok(res) => {
+        Ok(Ok(res)) => {
             tracing::debug!(
                 "insert_slot: slot {}, rows affected {}",
                 slot,
@@ -207,8 +194,8 @@ pub async fn insert_slot(
             );
             true
         }
-        Err(e) => {
-            tracing::error!("insert_slot: failed to insert slot {}: {}", slot, e);
+        error => {
+            tracing::error!("insert_slot: failed to insert slot {}: {:?}", slot, error);
             metrics::increment_db_errors();
             false
         }

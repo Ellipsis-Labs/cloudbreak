@@ -194,3 +194,103 @@ fn hash_partition_block(table_name: &str, parent_table: &str, num_partitions: u3
         "#
     )
 }
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use cloudbreak_core::{AccountSelectorConfig, EnvironmentInfo, PubkeyDef};
+    use sea_orm_migration::sea_orm::{DatabaseBackend, Statement};
+    use solana_pubkey::Pubkey;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via CLOUDBREAK_TEST_DATABASE_URL"]
+    async fn compatibility_checkpoint_migration_upgrade_and_rollback_preserve_legacy_data() {
+        let url = std::env::var("CLOUDBREAK_TEST_DATABASE_URL").unwrap();
+        let bootstrap = sea_orm::Database::connect(&url).await.unwrap();
+        let schema = format!("migration_compat_{}", std::process::id());
+        bootstrap
+            .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
+        let mut options = sea_orm::ConnectOptions::new(url);
+        options
+            .max_connections(1)
+            .set_schema_search_path(schema.clone());
+        let db = sea_orm::Database::connect(options).await.unwrap();
+        db.execute_unprepared("CREATE TABLE environment_info (id int PRIMARY KEY, mode text NOT NULL DEFAULT 'exclude', programs text NOT NULL DEFAULT '', solana_version text); CREATE TABLE accounts (pubkey bytea PRIMARY KEY, data bytea); INSERT INTO accounts VALUES ('\\x01','\\x0203');").await.unwrap();
+        let program = PubkeyDef(Pubkey::new_from_array([1; 32]));
+        let vault = PubkeyDef(Pubkey::new_from_array([2; 32]));
+        let legacy = AccountSelectorConfig {
+            include: vec![program.clone()],
+            ..Default::default()
+        };
+        EnvironmentInfo::upsert_filters(&db, &legacy).await.unwrap();
+        assert!(
+            EnvironmentInfo::load_filters(&db)
+                .await
+                .unwrap()
+                .accounts
+                .is_empty()
+        );
+        let exact = AccountSelectorConfig {
+            accounts: vec![vault],
+            ..legacy.clone()
+        };
+        assert!(EnvironmentInfo::upsert_filters(&db, &exact).await.is_err());
+        let manager = SchemaManager::new(&db);
+        let migration = m20261009_000000_atomic_account_checkpoints::Migration;
+        migration.up(&manager).await.unwrap();
+        EnvironmentInfo::upsert_filters(&db, &exact).await.unwrap();
+        assert_eq!(
+            EnvironmentInfo::load_filters(&db)
+                .await
+                .unwrap()
+                .accounts
+                .len(),
+            1
+        );
+        assert!(migration.down(&manager).await.is_err()); // never discard active filter metadata
+        EnvironmentInfo::upsert_filters(&db, &legacy).await.unwrap();
+        assert!(
+            EnvironmentInfo::load_filters(&db)
+                .await
+                .unwrap()
+                .accounts
+                .is_empty()
+        );
+        // The pre-change writer/reader SQL still works after the additive migration.
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO environment_info (id, mode, programs) VALUES (1, 'include', $1) ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs",
+            [program.0.to_string().into()],
+        )).await.unwrap();
+        assert!(
+            db.query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT mode, programs FROM environment_info WHERE id=1".to_string()
+            ))
+            .await
+            .unwrap()
+            .is_some()
+        );
+        migration.down(&manager).await.unwrap();
+        EnvironmentInfo::upsert_filters(&db, &legacy).await.unwrap();
+        let filters = EnvironmentInfo::load_filters(&db).await.unwrap();
+        assert!(filters.accounts.is_empty());
+        assert_eq!(filters.include[0].0, program.0);
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT data FROM accounts WHERE pubkey='\\x01'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<Vec<u8>>("", "data").unwrap(), vec![2, 3]);
+        db.close().await.unwrap();
+        bootstrap
+            .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+}

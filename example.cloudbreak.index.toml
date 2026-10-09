@@ -114,3 +114,6 @@ include = ["Stake11111111111111111111111111111111111111"]
 # [hash-checker]
 # time-limit = "4h"
 # slot-limit = 416520592
+# Opt-in atomic metadata for getPhoenixAccounts. Apply its migration first.
+# [phoenix-accounts]
+# enabled = true

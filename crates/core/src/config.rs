@@ -187,13 +187,33 @@ impl EnvironmentInfo {
             .collect::<Vec<_>>()
             .join(",");
 
-        db.execute(Statement::from_sql_and_values(
+        let has_accounts = db.query_one(Statement::from_string(
             DatabaseBackend::Postgres,
-            "INSERT INTO environment_info (id, mode, programs, accounts) VALUES (1, $1, $2, $3) \
-             ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs, accounts = EXCLUDED.accounts",
-            [mode.into(), programs_csv.into(), filters.accounts.iter().map(|p| p.0.to_string()).collect::<Vec<_>>().join(",").into()],
-        ))
-        .await?;
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('environment_info') AND attname = 'accounts' AND NOT attisdropped) AS has_accounts".to_string(),
+        )).await?.ok_or_else(|| anyhow::anyhow!("Missing schema metadata"))?.try_get::<bool>("", "has_accounts")?;
+        if has_accounts {
+            let accounts_csv = filters
+                .accounts
+                .iter()
+                .map(|p| p.0.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO environment_info (id, mode, programs, accounts) VALUES (1, $1, $2, $3) ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs, accounts = EXCLUDED.accounts",
+                [mode.into(), programs_csv.into(), accounts_csv.into()],
+            )).await?;
+        } else {
+            anyhow::ensure!(
+                filters.accounts.is_empty(),
+                "Exact-account indexing requires the atomic-account-checkpoints migration"
+            );
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO environment_info (id, mode, programs) VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET mode = EXCLUDED.mode, programs = EXCLUDED.programs",
+                [mode.into(), programs_csv.into()],
+            )).await?;
+        }
 
         Ok(())
     }
@@ -202,7 +222,7 @@ impl EnvironmentInfo {
         let row = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "SELECT mode, programs, accounts FROM environment_info WHERE id = 1".to_string(),
+                "SELECT mode, programs, COALESCE(to_jsonb(environment_info)->>'accounts', '') AS accounts FROM environment_info WHERE id = 1".to_string(),
             ))
             .await?
             .ok_or_else(|| {
@@ -409,6 +429,9 @@ pub struct TrackerConfig {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct IndexConfig {
+    /// Opt-in checkpoint publication for getPhoenixAccounts. Disabled preserves the legacy schema.
+    #[serde(rename = "phoenix-accounts", default)]
+    pub phoenix_accounts: MethodSection,
     /// If `Some`, the indexer will also download and process the snapshots
     pub snapshot: Option<SnapshotConfigOnIndexer>,
     pub database: DatabaseConfig,
@@ -459,10 +482,7 @@ pub struct SupplyConfig {
     pub enabled: bool,
     /// Accounts kept resident in the hot-accounts map, about 65 bytes each.
     /// Stake accounts live in the non-circulating stake map instead.
-    #[serde(
-        rename = "hot-accounts",
-        default = "SupplyConfig::default_hot_accounts"
-    )]
+    #[serde(rename = "hot-accounts", default = "SupplyConfig::default_hot_accounts")]
     pub hot_accounts: usize,
 }
 
@@ -1706,6 +1726,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn exact_accounts_override_owner_filters_without_expanding_program_coverage() {
         let key = Pubkey::new_from_array([1; 32]);
@@ -1720,7 +1742,34 @@ mod tests {
         assert!(!filters.is_account_selected(&Pubkey::new_from_array([4; 32]), &owner));
     }
 
-    use super::*;
+    #[test]
+    fn compatibility_legacy_config_keeps_phoenix_extensions_disabled() {
+        let api = api_config("").unwrap();
+        assert!(api.phoenix_accounts.is_none());
+        let api = api_config("[phoenix-accounts]\nenabled = false\n").unwrap();
+        assert!(!api.phoenix_accounts.unwrap().enabled);
+        let index: IndexConfig =
+            toml::from_str(include_str!("../../../example.cloudbreak.index.toml")).unwrap();
+        assert!(!index.phoenix_accounts.enabled);
+        assert!(index.programs.accounts.is_empty());
+        let filters: AccountSelectorConfig =
+            toml::from_str("include = []\nexclude = []\n").unwrap();
+        assert!(filters.accounts.is_empty());
+    }
+
+    #[test]
+    fn compatibility_standard_gpa_wire_format_matches_solana() {
+        let fixture = serde_json::json!({"encoding":"base64","commitment":"confirmed",
+            "filters":[{"dataSize":224}],"withContext":true,"sortResults":false});
+        let local: crate::modules::rpc_filter_type::RpcProgramAccountsConfig =
+            serde_json::from_value(fixture.clone()).unwrap();
+        let standard: solana_rpc_client_api::config::RpcProgramAccountsConfig =
+            serde_json::from_value(fixture).unwrap();
+        assert_eq!(
+            serde_json::to_value(local).unwrap(),
+            serde_json::to_value(standard).unwrap()
+        );
+    }
 
     // The eviction feature drops database indexes, so its defaults are a safety contract: it must
     // be off unless explicitly enabled, with conservative windows. Lock these so a refactor can't

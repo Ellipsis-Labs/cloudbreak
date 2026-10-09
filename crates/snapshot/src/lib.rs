@@ -3,17 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use agave_fs::FileInfo;
-use cloudbreak_core::{
-    Result, SnapshotConfig,
-    modules::{
-        account_owner_map::AccountOwnerMap,
-        largest_accounts::LargestAccountsTracker,
-        non_circulating::NonCirculatingTracker,
-        supply::{self, SupplyTracker},
-    },
-};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use agave_fs::FileInfo;
 use solana_accounts_db::accounts_file::AccountsFile;
 use std::{
     path::PathBuf,
@@ -23,6 +14,15 @@ use tokio::{sync::mpsc::Sender, task::JoinSet};
 use tokio::{task::JoinHandle, time::Instant};
 use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
+};
+use cloudbreak_core::{
+    Result, SnapshotConfig,
+    modules::{
+        account_owner_map::AccountOwnerMap,
+        largest_accounts::LargestAccountsTracker,
+        non_circulating::NonCirculatingTracker,
+        supply::{self, SupplyTracker},
+    },
 };
 
 use crate::{
@@ -125,9 +125,7 @@ pub async fn run(
 
     // Membership flips first: GLA seeds its class sentinels from it, and every
     // supply commit reads its running sum.
-    non_circulating
-        .finish_bootstrap_and_persist(&database)
-        .await;
+    non_circulating.finish_bootstrap_and_persist(&database).await;
     largest_accounts
         .finish_bootstrap_and_persist(&database, &non_circulating)
         .await;

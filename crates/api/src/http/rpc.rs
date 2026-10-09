@@ -275,7 +275,7 @@ async fn process_single_request(
         }
         "getPhoenixAccounts" => {
             let config: Option<methods::phoenix_accounts::GetPhoenixAccountsConfig> =
-                match extract_param(&rpc_request.params, 0) {
+                match extract_optional_param(&rpc_request.params, 0) {
                     Ok(config) => config,
                     Err(e) => return make_error_response(id, -32602, e),
                 };
@@ -671,10 +671,7 @@ async fn process_single_request(
             json_response
         }
         _ => {
-            let reason = if matches!(
-                method,
-                "getVoteAccounts" | "simulateTransaction" | "getSupply"
-            ) {
+            let reason = if matches!(method, "getVoteAccounts" | "simulateTransaction" | "getSupply") {
                 "not enabled on this node"
             } else {
                 "unknown method"
@@ -757,5 +754,83 @@ async fn gpa_streamed_to_buffered(
             .inc();
         let err_response = JsonRpcResponse::<()>::from_rpc_error(id, &RpcError::InternalError);
         serde_json::to_vec(&err_response).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::modules::{
+        cache::GpaProcessor, supply_cache::SupplySnapshot, vote_accounts_cache::StakesSnapshot,
+    };
+    use cloudbreak_core::modules::processed::ProcessedAccounts;
+    use cloudbreak_core::{
+        AccountSelectorConfig, MethodSection, PhoenixAccountsConfig, ProcessedCommitmentBehavior,
+        UnhealthyResponseBehavior,
+    };
+    use std::{sync::RwLock, time::Duration};
+
+    #[tokio::test]
+    async fn compatibility_disabled_phoenix_rpc_never_uses_database_and_legacy_rpc_works() {
+        let mut state = CloudbreakRpcState::new(
+            sea_orm::DatabaseConnection::Disconnected,
+            Duration::from_secs(1),
+            None,
+            None,
+            Arc::new(AccountSelectorConfig::default()),
+            1,
+            None,
+            Duration::from_secs(1),
+            ProcessedCommitmentBehavior::default(),
+            UnhealthyResponseBehavior::default(),
+            GpaProcessor::new(None),
+            "legacy-genesis".into(),
+            false,
+            Arc::new(RwLock::new(Arc::new(StakesSnapshot::empty()))),
+            100,
+            false,
+            false,
+            Arc::new(RwLock::new(Arc::new(SupplySnapshot::default()))),
+            MethodSection::default(),
+            MethodSection::default(),
+            ProcessedAccounts::default(),
+        );
+        let ctx = Arc::new(RequestContext {
+            subscription_id: "compatibility".into(),
+            request_id: "test".into(),
+            client_ip: "local".into(),
+        });
+        for section in [None, Some(PhoenixAccountsConfig::default())] {
+            state.phoenix_accounts = section;
+            for params in [
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::json!([null]),
+                serde_json::json!([{}]),
+            ] {
+                let request = serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":7,"method":"getPhoenixAccounts","params":params})).unwrap();
+                let reply =
+                    process_single_request(request, &Arc::new(state.clone()), &ctx, false).await;
+                assert_eq!(reply.status, StatusCode::OK);
+                let ResponseBody::Buffered(bytes) = reply.body else {
+                    panic!("expected buffered error")
+                };
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(json["id"], 7);
+                assert_eq!(json["error"]["code"], -32601);
+            }
+        }
+        let request = serde_json::from_value(
+            serde_json::json!({"jsonrpc":"2.0","id":8,"method":"getGenesisHash","params":[]}),
+        )
+        .unwrap();
+        let reply = process_single_request(request, &Arc::new(state), &ctx, false).await;
+        let ResponseBody::Buffered(bytes) = reply.body else {
+            panic!("expected buffered result")
+        };
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({"jsonrpc":"2.0","id":8,"result":"legacy-genesis"})
+        );
     }
 }

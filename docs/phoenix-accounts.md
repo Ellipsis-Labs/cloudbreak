@@ -4,7 +4,7 @@
 
 ## Configuration and rollout
 
-Apply the new Cloudbreak migration before starting the upgraded indexer or API. It adds an exact-account filter column and a single checkpoint row; it does not reset or delete account data. Do not start the new binaries against the old schema.
+Apply the new Cloudbreak migration before enabling Phoenix snapshots or exact-account indexing. With both extensions disabled, the upgraded API/indexer also support the legacy schema. It adds an exact-account filter column and a single checkpoint row; it does not reset or delete account data. Enable checkpoint publication on the indexer with `[phoenix-accounts] enabled = true`, and then enable the API method after a complete checkpoint exists.
 
 Set identical program filters and exact vault keys on both the indexer and snapshot loader:
 
@@ -75,3 +75,13 @@ The API reads checkpoint, health and accounts in one read-only repeatable-read t
 Overlapping requests with identical normalized program selections share one database read and compression job through a per-API worker, a bounded request channel and oneshot response fanout. Compression and base64 encoding run on blocking workers. The compressed/base64 payload is shared through an `Arc`; each HTTP response still serializes its own JSON envelope and transmits its own bytes. Caller disconnects do not cancel a build needed by other consumers. Build errors fan out to waiting callers, and the next request can retry.
 
 Each caller checks its own `minContextSlot` against the shared result. If that checkpoint is too old, the caller receives `MinContextSlotNotReached`; coalescing does not silently weaken its minimum. Different program selections never share payloads. Duplicate IDs and different input ordering share work when their final program sets are identical. After fanout, the completed result is dropped; requests arriving later reread the current checkpoint. Coalescing applies within one API instance, not across replicas. This does not add leader election, blue/green routing or deployment automation. Measure CPU/database load before increasing polling frequency.
+
+## Compatibility and rollback
+
+Existing RPC wire formats and legacy configuration defaults are preserved. The indexer checkpoint section defaults to disabled; ordinary slot publication keeps its original parameters and does not touch the extension table. Filter metadata reads support both schemas, and legacy filter writes do not require the new column.
+
+The migration is additive. Legacy SQL readers/writers can access the migrated schema, but an older indexer does not maintain exact vault keys or atomic checkpoints; mixed-version operation of the new endpoint is unsupported. Upgrade and enable the producer before exposing the new endpoint.
+
+For rollback, stop serving the new endpoint and stop checkpoint publication. Remove exact-account filters, restart the indexer so its published filter metadata is cleared, and only then roll back the migration if needed. The down migration refuses to remove nonempty exact-account metadata. Existing account rows are retained. Baseline API/indexer operation supports the rolled-back schema; remove Phoenix-specific configuration before running older binaries.
+
+The generic account-write/slot-publication failure guards remain active even when the endpoint is disabled: failing to persist a complete slot marks the node unhealthy and stops publication/cleanup. This intentional safety behavior is separate from the opt-in checkpoint extension.

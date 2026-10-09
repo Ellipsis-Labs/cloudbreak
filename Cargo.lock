@@ -1738,6 +1738,7 @@ dependencies = [
  "hex",
  "sea-orm-migration",
  "solana-pubkey 4.3.0",
+ "tokio",
 ]
 
 [[package]]

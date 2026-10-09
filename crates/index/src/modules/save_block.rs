@@ -254,17 +254,30 @@ pub async fn save_block(
     }
 
     // Wait until the chunk processing is finished to insert the slot (this ensures that gPA calls can only read from completed slots)
-    let published = db_queries::insert_slot(
-        slot,
-        block.block_time,
-        Some(&block.blockhash),
-        CommitmentLevel::Confirmed,
-        updated_accounts_during_startup.health.is_healthy(),
-        (!is_repaired).then_some(transaction_count),
-        db,
-        &config,
-    )
-    .await;
+    let healthy = updated_accounts_during_startup.health.is_healthy();
+    let published = if config.phoenix_accounts.enabled {
+        modules::account_checkpoint::publish_confirmed_slot(
+            slot,
+            block.block_time,
+            &block.blockhash,
+            healthy,
+            (!is_repaired).then_some(transaction_count),
+            db,
+            &config,
+        )
+        .await
+    } else {
+        db_queries::insert_slot(
+            slot,
+            block.block_time,
+            Some(&block.blockhash),
+            CommitmentLevel::Confirmed,
+            healthy,
+            db,
+            &config,
+        )
+        .await
+    };
 
     if !published {
         db_queries::update_service_health(db, false).await;
